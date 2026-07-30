@@ -1399,6 +1399,24 @@ public abstract class IcebergAbstractMetadata
     }
 
     @Override
+    public Optional<ConnectorTableVersion> getCurrentTableVersion(ConnectorSession session, ConnectorTableHandle tableHandle)
+    {
+        IcebergTableHandle icebergTableHandle = (IcebergTableHandle) tableHandle;
+        Table icebergTable = getIcebergTable(session, icebergTableHandle.getSchemaTableName());
+        Snapshot currentSnapshot = icebergTable.currentSnapshot();
+
+        if (currentSnapshot == null || !supportsRowLineage(icebergTable)) {
+            return Optional.empty();
+        }
+
+        return Optional.of(new ConnectorTableVersion(
+                VersionType.VERSION,
+                VersionOperator.EQUAL,
+                BigintType.BIGINT,
+                currentSnapshot.snapshotId()));
+    }
+
+    @Override
     public IcebergTableHandle getTableHandle(ConnectorSession session, SchemaTableName tableName, Optional<ConnectorTableVersion> tableVersion)
     {
         IcebergTableName name = IcebergTableName.from(tableName.getTableName());
