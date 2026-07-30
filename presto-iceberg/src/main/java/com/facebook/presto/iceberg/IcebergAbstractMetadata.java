@@ -1404,9 +1404,9 @@ public abstract class IcebergAbstractMetadata
     {
         IcebergTableHandle icebergTableHandle = (IcebergTableHandle) tableHandle;
         Table icebergTable = getIcebergTable(session, icebergTableHandle.getSchemaTableName());
-        Snapshot currentSnapshot = icebergTable.currentSnapshot();
+        Optional<Long> snapshotId = icebergTableHandle.getIcebergTableName().getSnapshotId();
 
-        if (currentSnapshot == null || !supportsRowLineage(icebergTable)) {
+        if (!snapshotId.isPresent() || !supportsRowLineage(icebergTable)) {
             return Optional.empty();
         }
 
@@ -1414,7 +1414,7 @@ public abstract class IcebergAbstractMetadata
                 VersionType.VERSION,
                 VersionOperator.EQUAL,
                 BigintType.BIGINT,
-                currentSnapshot.snapshotId()));
+                snapshotId.get()));
     }
 
     @Override
