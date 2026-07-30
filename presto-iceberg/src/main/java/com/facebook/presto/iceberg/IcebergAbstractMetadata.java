@@ -41,6 +41,7 @@ import com.facebook.presto.iceberg.procedure.context.IcebergCommonProcedureConte
 import com.facebook.presto.iceberg.statistics.StatisticsFileCache;
 import com.facebook.presto.iceberg.transaction.IcebergTransactionContext;
 import com.facebook.presto.iceberg.transaction.IcebergTransactionMetadata;
+import com.facebook.presto.spi.ChangedRowsPredicate;
 import com.facebook.presto.spi.ColumnHandle;
 import com.facebook.presto.spi.ColumnMetadata;
 import com.facebook.presto.spi.ConnectorDeleteTableHandle;
@@ -2221,6 +2222,8 @@ public abstract class IcebergAbstractMetadata
         OptionalInt maxSnapshotsPerRefresh = resolveMaxSnapshotsPerRefresh(session, props);
 
         ImmutableMap.Builder<SchemaTableName, MaterializedViewStatus.MaterializedDataPredicates> predicatesByBase = ImmutableMap.builder();
+        ImmutableMap.Builder<SchemaTableName, ConnectorTableHandle> recordedHandlesByBase = ImmutableMap.builder();
+        ImmutableMap.Builder<SchemaTableName, ChangedRowsPredicate> changedRowsByBase = ImmutableMap.builder();
         for (SchemaTableName baseTable : definition.get().getBaseTables()) {
             Table baseIcebergTable = getIcebergTable(session, baseTable);
             long currentSnapshotId = baseIcebergTable.currentSnapshot() != null
@@ -2270,11 +2273,34 @@ public abstract class IcebergAbstractMetadata
             }
 
             TupleDomain<String> incrementalRefreshPredicate = TupleDomain.all();
+            TupleDomain<ColumnHandle> refreshBound = TupleDomain.all();
             if (targetSnapshotId != currentSnapshotId) {
                 long targetSequenceNumber = baseIcebergTable.snapshot(targetSnapshotId).sequenceNumber();
                 incrementalRefreshPredicate = TupleDomain.withColumnDomains(ImmutableMap.of(
                         MetadataColumns.LAST_UPDATED_SEQUENCE_NUMBER.name(),
                         Domain.create(ValueSet.ofRanges(Range.lessThanOrEqual(BigintType.BIGINT, targetSequenceNumber)), false)));
+                refreshBound = TupleDomain.withColumnDomains(ImmutableMap.of(
+                        LAST_UPDATED_SEQUENCE_NUMBER_COLUMN_HANDLE,
+                        Domain.create(ValueSet.ofRanges(Range.lessThanOrEqual(BigintType.BIGINT, targetSequenceNumber)), false)));
+            }
+
+            // Row-level change tracking requires a concrete recorded snapshot. A base table
+            // with no recorded snapshot continues through the existing partition path.
+            if (recordedSnapshotId != 0 && supportsRowLineage(baseIcebergTable)) {
+                Snapshot recordedSnapshot = baseIcebergTable.snapshot(recordedSnapshotId);
+                if (recordedSnapshot != null) {
+                    ConnectorTableVersion recordedVersion = new ConnectorTableVersion(
+                            VersionType.VERSION,
+                            VersionOperator.EQUAL,
+                            BigintType.BIGINT,
+                            recordedSnapshotId);
+                    recordedHandlesByBase.put(baseTable, getTableHandle(session, baseTable, Optional.of(recordedVersion)));
+                    changedRowsByBase.put(baseTable, new ChangedRowsPredicate(
+                            ImmutableList.of(TupleDomain.withColumnDomains(ImmutableMap.of(
+                                    LAST_UPDATED_SEQUENCE_NUMBER_COLUMN_HANDLE,
+                                    Domain.create(ValueSet.ofRanges(Range.greaterThan(BigintType.BIGINT, recordedSnapshot.sequenceNumber())), false)))),
+                            refreshBound));
+                }
             }
 
             // We pass an empty list of column names for now as they are not used when legacy_materialized_views=false.
@@ -2288,7 +2314,12 @@ public abstract class IcebergAbstractMetadata
         if (staleBases.isEmpty()) {
             return new MaterializedViewStatus(FULLY_MATERIALIZED, ImmutableMap.of(), lastFreshTime);
         }
-        return new MaterializedViewStatus(PARTIALLY_MATERIALIZED, staleBases, lastFreshTime);
+        return new MaterializedViewStatus(
+                PARTIALLY_MATERIALIZED,
+                staleBases,
+                lastFreshTime,
+                recordedHandlesByBase.build(),
+                changedRowsByBase.build());
     }
 
     private MaterializedViewStatus getTimestampBasedMaterializedViewStatus(
