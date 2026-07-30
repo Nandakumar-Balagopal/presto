@@ -105,10 +105,12 @@ import org.apache.iceberg.BaseTable;
 import org.apache.iceberg.DataFile;
 import org.apache.iceberg.DataFiles;
 import org.apache.iceberg.DeleteFiles;
+import org.apache.iceberg.ChangelogScanTask;
 import org.apache.iceberg.FileFormat;
 import org.apache.iceberg.FileMetadata;
 import org.apache.iceberg.FileScanTask;
 import org.apache.iceberg.IncrementalAppendScan;
+import org.apache.iceberg.IncrementalChangelogScan;
 import org.apache.iceberg.ManageSnapshots;
 import org.apache.iceberg.ManifestFile;
 import org.apache.iceberg.MetadataColumns;
@@ -1415,6 +1417,39 @@ public abstract class IcebergAbstractMetadata
                 VersionOperator.EQUAL,
                 BigintType.BIGINT,
                 snapshotId.get()));
+    }
+
+    @Override
+    public OptionalLong estimateChangeSetSize(ConnectorSession session, ConnectorTableHandle tableHandle, ConnectorTableVersion from, ConnectorTableVersion to)
+    {
+        IcebergTableHandle icebergTableHandle = (IcebergTableHandle) tableHandle;
+        Table icebergTable = getIcebergTable(session, icebergTableHandle.getSchemaTableName());
+        if (!supportsRowLineage(icebergTable)) {
+            return OptionalLong.empty();
+        }
+
+        long fromSnapshotId = getSnapshotIdForTableVersion(icebergTable, from);
+        long toSnapshotId = getSnapshotIdForTableVersion(icebergTable, to);
+        if (fromSnapshotId == toSnapshotId) {
+            return OptionalLong.of(0);
+        }
+        if (!isAncestorOf(icebergTable, toSnapshotId, fromSnapshotId)) {
+            return OptionalLong.empty();
+        }
+
+        IncrementalChangelogScan scan = icebergTable.newIncrementalChangelogScan()
+                .fromSnapshotExclusive(fromSnapshotId)
+                .toSnapshot(toSnapshotId);
+        long sizeInBytes = 0;
+        try (CloseableIterable<ChangelogScanTask> tasks = scan.planFiles()) {
+            for (ChangelogScanTask task : tasks) {
+                sizeInBytes = Math.addExact(sizeInBytes, task.length());
+            }
+        }
+        catch (IOException | ArithmeticException e) {
+            return OptionalLong.empty();
+        }
+        return OptionalLong.of(sizeInBytes);
     }
 
     @Override
