@@ -17,6 +17,7 @@ import com.facebook.presto.common.CatalogSchemaName;
 import com.facebook.presto.common.QualifiedObjectName;
 import com.facebook.presto.common.predicate.TupleDomain;
 import com.facebook.presto.common.type.Type;
+import com.facebook.presto.spi.ChangeKindPageSource;
 import com.facebook.presto.spi.ColumnHandle;
 import com.facebook.presto.spi.ColumnMetadata;
 import com.facebook.presto.spi.ConnectorDeleteTableHandle;
@@ -834,6 +835,40 @@ public interface ConnectorMetadata
     default MaterializedViewStatus getMaterializedViewStatus(ConnectorSession session, SchemaTableName materializedViewName, TupleDomain<String> baseQueryDomain)
     {
         throw new PrestoException(NOT_SUPPORTED, "This connector does not support getting materialized views status");
+    }
+
+    /**
+     * Returns the version embedded in a table handle when the connector supports row-level change tracking.
+     */
+    default Optional<ConnectorTableVersion> getCurrentTableVersion(ConnectorSession session, ConnectorTableHandle table)
+    {
+        return Optional.empty();
+    }
+
+    /**
+     * Returns changes between two table versions. Connectors must return pre-change values for DELETE and UPDATE_BEFORE rows.
+     */
+    default ChangeKindPageSource getChangeSet(
+            ConnectorSession session,
+            ConnectorTableHandle table,
+            ConnectorTableVersion from,
+            ConnectorTableVersion to,
+            List<ColumnHandle> projectedDataColumns,
+            TupleDomain<ColumnHandle> filter)
+    {
+        throw new UnsupportedOperationException("This connector does not support row-level change tracking");
+    }
+
+    /**
+     * Returns the expected number of rows in the change set, if it is available without scanning table data.
+     */
+    default OptionalLong estimateChangeSetSize(
+            ConnectorSession session,
+            ConnectorTableHandle table,
+            ConnectorTableVersion from,
+            ConnectorTableVersion to)
+    {
+        return OptionalLong.empty();
     }
 
     /**
