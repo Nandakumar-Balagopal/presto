@@ -20,6 +20,7 @@ import com.facebook.presto.common.block.BlockEncodingSerde;
 import com.facebook.presto.common.predicate.TupleDomain;
 import com.facebook.presto.common.type.Type;
 import com.facebook.presto.common.type.TypeSignature;
+import com.facebook.presto.spi.ChangeKindPageSource;
 import com.facebook.presto.spi.ColumnHandle;
 import com.facebook.presto.spi.ColumnMetadata;
 import com.facebook.presto.spi.ConnectorId;
@@ -1324,6 +1325,24 @@ public class StatsRecordingMetadataManager
         finally {
             stats.recordGetHandleVersionCall(System.nanoTime() - startTime);
         }
+    }
+
+    @Override
+    public Optional<ConnectorTableVersion> getCurrentTableVersion(Session session, TableHandle tableHandle)
+    {
+        return delegate.getCurrentTableVersion(session, tableHandle);
+    }
+
+    @Override
+    public ChangeKindPageSource getChangeSet(Session session, TableHandle tableHandle, ConnectorTableVersion from, ConnectorTableVersion to, List<ColumnHandle> projectedDataColumns, TupleDomain<ColumnHandle> filter)
+    {
+        return delegate.getChangeSet(session, tableHandle, from, to, projectedDataColumns, filter);
+    }
+
+    @Override
+    public OptionalLong estimateChangeSetSize(Session session, TableHandle tableHandle, ConnectorTableVersion from, ConnectorTableVersion to)
+    {
+        return delegate.estimateChangeSetSize(session, tableHandle, from, to);
     }
 
     @Override

@@ -27,6 +27,7 @@ import com.facebook.presto.common.predicate.TupleDomain;
 import com.facebook.presto.common.type.Type;
 import com.facebook.presto.common.type.TypeSignature;
 import com.facebook.presto.metadata.Catalog.CatalogContext;
+import com.facebook.presto.spi.ChangeKindPageSource;
 import com.facebook.presto.spi.ColumnHandle;
 import com.facebook.presto.spi.ColumnMetadata;
 import com.facebook.presto.spi.ConnectorDeleteTableHandle;
@@ -444,6 +445,39 @@ public class MetadataManager
     public Optional<TableHandle> getHandleVersion(Session session, QualifiedObjectName tableName, Optional<ConnectorTableVersion> tableVersion)
     {
         return getOptionalTableHandle(session, transactionManager, tableName, tableVersion);
+    }
+
+    @Override
+    public Optional<ConnectorTableVersion> getCurrentTableVersion(Session session, TableHandle tableHandle)
+    {
+        ConnectorId connectorId = tableHandle.getConnectorId();
+        return getMetadata(session, connectorId).getCurrentTableVersion(session.toConnectorSession(connectorId), tableHandle.getConnectorHandle());
+    }
+
+    @Override
+    public ChangeKindPageSource getChangeSet(
+            Session session,
+            TableHandle tableHandle,
+            ConnectorTableVersion from,
+            ConnectorTableVersion to,
+            List<ColumnHandle> projectedDataColumns,
+            TupleDomain<ColumnHandle> filter)
+    {
+        ConnectorId connectorId = tableHandle.getConnectorId();
+        return getMetadata(session, connectorId).getChangeSet(
+                session.toConnectorSession(connectorId),
+                tableHandle.getConnectorHandle(),
+                from,
+                to,
+                projectedDataColumns,
+                filter);
+    }
+
+    @Override
+    public OptionalLong estimateChangeSetSize(Session session, TableHandle tableHandle, ConnectorTableVersion from, ConnectorTableVersion to)
+    {
+        ConnectorId connectorId = tableHandle.getConnectorId();
+        return getMetadata(session, connectorId).estimateChangeSetSize(session.toConnectorSession(connectorId), tableHandle.getConnectorHandle(), from, to);
     }
 
     @Override

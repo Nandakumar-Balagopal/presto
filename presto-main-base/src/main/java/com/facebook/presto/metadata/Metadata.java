@@ -21,6 +21,7 @@ import com.facebook.presto.common.predicate.TupleDomain;
 import com.facebook.presto.common.type.Type;
 import com.facebook.presto.common.type.TypeSignature;
 import com.facebook.presto.metadata.Catalog.CatalogContext;
+import com.facebook.presto.spi.ChangeKindPageSource;
 import com.facebook.presto.spi.ColumnHandle;
 import com.facebook.presto.spi.ColumnMetadata;
 import com.facebook.presto.spi.ConnectorId;
@@ -96,6 +97,18 @@ public interface Metadata
      * Returns a table handle for time travel expression
      */
     Optional<TableHandle> getHandleVersion(Session session, QualifiedObjectName tableName, Optional<ConnectorTableVersion> tableVersion);
+
+    Optional<ConnectorTableVersion> getCurrentTableVersion(Session session, TableHandle tableHandle);
+
+    ChangeKindPageSource getChangeSet(
+            Session session,
+            TableHandle tableHandle,
+            ConnectorTableVersion from,
+            ConnectorTableVersion to,
+            List<ColumnHandle> projectedDataColumns,
+            TupleDomain<ColumnHandle> filter);
+
+    OptionalLong estimateChangeSetSize(Session session, TableHandle tableHandle, ConnectorTableVersion from, ConnectorTableVersion to);
 
     Optional<TableHandle> getTableHandleForStatisticsCollection(Session session, QualifiedObjectName tableName, Map<String, Object> analyzeProperties);
 
