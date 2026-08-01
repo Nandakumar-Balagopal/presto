@@ -53,6 +53,7 @@ import com.facebook.presto.sql.relational.RowExpressionDomainTranslator;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableListMultimap;
 import com.google.common.collect.ImmutableMap;
+import com.google.common.collect.ImmutableSet;
 import com.google.common.collect.ListMultimap;
 
 import java.util.ArrayList;
@@ -61,6 +62,7 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import java.util.function.Function;
 
 import static com.facebook.presto.expressions.LogicalRowExpressions.or;
@@ -72,6 +74,7 @@ import static com.facebook.presto.sql.relational.Expressions.not;
 import static com.google.common.base.Preconditions.checkState;
 import static com.google.common.collect.ImmutableList.toImmutableList;
 import static com.google.common.collect.ImmutableMap.toImmutableMap;
+import static com.google.common.collect.ImmutableSet.toImmutableSet;
 import static java.util.Objects.requireNonNull;
 import static java.util.function.Function.identity;
 
@@ -461,7 +464,11 @@ public class DifferentialPlanRewriter
             return new PlanVariants(
                     new NodeWithMapping(deltaNode, deltaResult.getMapping()),
                     currentResult,
-                    new NodeWithMapping(unchangedNode, unchangedResult.getMapping()));
+                    new NodeWithMapping(unchangedNode, unchangedResult.getMapping()),
+                    Optional.of(stalePredicates.stream()
+                            .flatMap(predicate -> predicate.getDomains().orElse(ImmutableMap.of()).keySet().stream())
+                            .map(column -> new TableColumn(tableName, column))
+                            .collect(toImmutableSet())));
         }
 
         private NodeWithMapping buildTableScan(TableScanNode original, List<VariableReferenceExpression> variables)
@@ -496,7 +503,8 @@ public class DifferentialPlanRewriter
             return new PlanVariants(
                     buildFilter(node, child.delta()),
                     buildFilter(node, child.current()),
-                    buildFilter(node, child.unchanged()));
+                    buildFilter(node, child.unchanged()),
+                    child.deltaClosureColumns());
         }
 
         private NodeWithMapping buildFilter(FilterNode original, NodeWithMapping source)
@@ -516,7 +524,8 @@ public class DifferentialPlanRewriter
             return new PlanVariants(
                     buildProject(node, child.delta()),
                     buildProject(node, child.current()),
-                    buildProject(node, child.unchanged()));
+                    buildProject(node, child.unchanged()),
+                    projectClosure(child.deltaClosureColumns()));
         }
 
         private NodeWithMapping buildProject(ProjectNode original, NodeWithMapping source)
@@ -540,7 +549,8 @@ public class DifferentialPlanRewriter
             return new PlanVariants(
                     buildAggregation(node, child.delta()),
                     buildAggregation(node, child.current()),
-                    buildAggregation(node, child.unchanged()));
+                    buildAggregation(node, child.unchanged()),
+                    Optional.empty());
         }
 
         private NodeWithMapping buildAggregation(AggregationNode original, NodeWithMapping source)
@@ -581,7 +591,7 @@ public class DifferentialPlanRewriter
             // Union the delta terms
             NodeWithMapping deltaResult = createBinaryUnion(node, deltaLeftResult.getNode(), deltaRightResult.getNode());
 
-            return new PlanVariants(deltaResult, currentResult, unchangedResult);
+            return new PlanVariants(deltaResult, currentResult, unchangedResult, intersectClosures(leftVariants, rightVariants));
         }
 
         private NodeWithMapping buildJoin(JoinNode original, NodeWithMapping left, NodeWithMapping right)
@@ -601,7 +611,8 @@ public class DifferentialPlanRewriter
             return new PlanVariants(
                     buildUnion(node, children.stream().map(PlanVariants::delta).collect(toImmutableList())),
                     buildUnion(node, children.stream().map(PlanVariants::current).collect(toImmutableList())),
-                    buildUnion(node, children.stream().map(PlanVariants::unchanged).collect(toImmutableList())));
+                    buildUnion(node, children.stream().map(PlanVariants::unchanged).collect(toImmutableList())),
+                    intersectClosures(children));
         }
 
         private NodeWithMapping buildUnion(UnionNode original, List<NodeWithMapping> sources)
@@ -637,7 +648,7 @@ public class DifferentialPlanRewriter
             IntersectNode deltaRight = buildIntersectDeltaRight(node, sources, allVariants);
             NodeWithMapping deltaUnionResult = createBinaryUnion(node, deltaLeft, deltaRight);
 
-            return new PlanVariants(deltaUnionResult, currentResult, unchangedResult);
+            return new PlanVariants(deltaUnionResult, currentResult, unchangedResult, intersectClosures(allVariants));
         }
 
         private IntersectNode buildIntersectDeltaLeft(
@@ -745,7 +756,42 @@ public class DifferentialPlanRewriter
             ExceptNode deltaRight = buildExceptDeltaRight(node, sources, allVariants);
             NodeWithMapping deltaUnionResult = createBinaryUnion(node, deltaLeft, deltaRight);
 
-            return new PlanVariants(deltaUnionResult, currentResult, unchangedResult);
+            return new PlanVariants(deltaUnionResult, currentResult, unchangedResult, intersectClosures(allVariants));
+        }
+
+        private Optional<Set<TableColumn>> projectClosure(Optional<Set<TableColumn>> closure)
+        {
+            // A projection can remove or transform a stale-boundary column. Until the
+            // pass-through mapping is carried with PlanVariants, treat non-empty closures
+            // as unknown so aggregation dispatch selects the conservative expansion path.
+            if (!closure.isPresent() || !closure.get().isEmpty()) {
+                return Optional.empty();
+            }
+            return closure;
+        }
+
+        private Optional<Set<TableColumn>> intersectClosures(PlanVariants... variants)
+        {
+            return intersectClosures(Arrays.asList(variants));
+        }
+
+        private Optional<Set<TableColumn>> intersectClosures(List<PlanVariants> variants)
+        {
+            if (variants.stream().anyMatch(variant -> !variant.deltaClosureColumns().isPresent())) {
+                return Optional.empty();
+            }
+
+            if (variants.isEmpty()) {
+                return Optional.of(ImmutableSet.of());
+            }
+
+            ImmutableSet.Builder<TableColumn> result = ImmutableSet.builder();
+            for (TableColumn column : variants.get(0).deltaClosureColumns().get()) {
+                if (variants.stream().allMatch(variant -> variant.deltaClosureColumns().get().contains(column))) {
+                    result.add(column);
+                }
+            }
+            return Optional.of(result.build());
         }
 
         private ExceptNode buildExceptDeltaLeft(ExceptNode original, List<PlanVariants> allVariants)
@@ -1098,12 +1144,20 @@ public class DifferentialPlanRewriter
         private final NodeWithMapping delta;
         private final NodeWithMapping current;
         private final NodeWithMapping unchanged;
+        private final Optional<Set<TableColumn>> deltaClosureColumns;
 
         PlanVariants(NodeWithMapping delta, NodeWithMapping current, NodeWithMapping unchanged)
+        {
+            this(delta, current, unchanged, Optional.empty());
+        }
+
+        PlanVariants(NodeWithMapping delta, NodeWithMapping current, NodeWithMapping unchanged, Optional<Set<TableColumn>> deltaClosureColumns)
         {
             this.delta = requireNonNull(delta, "delta is null");
             this.current = requireNonNull(current, "current is null");
             this.unchanged = requireNonNull(unchanged, "unchanged is null");
+            this.deltaClosureColumns = requireNonNull(deltaClosureColumns, "deltaClosureColumns is null")
+                    .map(ImmutableSet::copyOf);
         }
 
         NodeWithMapping delta()
@@ -1119,6 +1173,11 @@ public class DifferentialPlanRewriter
         NodeWithMapping unchanged()
         {
             return unchanged;
+        }
+
+        Optional<Set<TableColumn>> deltaClosureColumns()
+        {
+            return deltaClosureColumns;
         }
     }
 }
