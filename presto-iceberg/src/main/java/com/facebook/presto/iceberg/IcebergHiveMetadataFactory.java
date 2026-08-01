@@ -62,6 +62,31 @@ public class IcebergHiveMetadataFactory
     final boolean metastoreImpersonationEnabled;
     final int metastorePartitionCacheMaxColumnCount;
 
+    public IcebergHiveMetadataFactory(
+            IcebergCatalogName catalogName,
+            ExtendedHiveMetastore metastore,
+            HdfsEnvironment hdfsEnvironment,
+            TypeManager typeManager,
+            ProcedureRegistry procedureRegistry,
+            StandardFunctionResolution functionResolution,
+            RowExpressionService rowExpressionService,
+            JsonCodec<CommitTaskData> commitTaskCodec,
+            JsonCodec<List<ColumnMapping>> columnMappingsCodec,
+            JsonCodec<List<SchemaTableName>> schemaTableNamesCodec,
+            NodeVersion nodeVersion,
+            FilterStatsCalculatorService filterStatsCalculatorService,
+            IcebergHiveTableOperationsConfig operationsConfig,
+            StatisticsFileCache statisticsFileCache,
+            ManifestFileCache manifestFileCache,
+            IcebergTableProperties tableProperties,
+            ConnectorSystemConfig connectorSystemConfig,
+            MetastoreClientConfig metastoreClientConfig)
+    {
+        this(catalogName, metastore, hdfsEnvironment, typeManager, procedureRegistry, functionResolution, rowExpressionService,
+                commitTaskCodec, columnMappingsCodec, schemaTableNamesCodec, nodeVersion, filterStatsCalculatorService,
+                operationsConfig, statisticsFileCache, manifestFileCache, tableProperties, connectorSystemConfig, null, metastoreClientConfig);
+    }
+
     @Inject
     public IcebergHiveMetadataFactory(
             IcebergCatalogName catalogName,

@@ -384,7 +384,7 @@ public abstract class IcebergAbstractMetadata
         this.filterStatsCalculatorService = requireNonNull(filterStatsCalculatorService, "filterStatsCalculatorService is null");
         this.statisticsFileCache = requireNonNull(statisticsFileCache, "statisticsFileCache is null");
         this.tableProperties = requireNonNull(tableProperties, "tableProperties is null");
-        this.pageSourceProvider = requireNonNull(pageSourceProvider, "pageSourceProvider is null");
+        this.pageSourceProvider = pageSourceProvider;
         this.transactionContext = new IcebergTransactionContext(isolationLevel, autoCommitContext);
     }
 
@@ -1126,6 +1126,9 @@ public abstract class IcebergAbstractMetadata
     public void finishStatisticsCollection(ConnectorSession session, ConnectorTableHandle tableHandle, Collection<ComputedStatistics> computedStatistics)
     {
         IcebergTableHandle icebergTableHandle = (IcebergTableHandle) tableHandle;
+        if (pageSourceProvider == null) {
+            throw new PrestoException(NOT_SUPPORTED, "Row-level change tracking requires an Iceberg page source provider");
+        }
         Table icebergTable = getIcebergTable(session, icebergTableHandle.getSchemaTableName());
         TableStatisticsMaker.writeTableStatistics(nodeVersion, typeManager, icebergTableHandle, icebergTable, session, computedStatistics);
     }

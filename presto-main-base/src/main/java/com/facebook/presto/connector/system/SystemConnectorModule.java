@@ -82,6 +82,7 @@ public class SystemConnectorModule
         binder.bind(SystemConnectorRegistrar.class).asEagerSingleton();
 
         Multibinder<ConnectorTableFunction> tableFunctions = Multibinder.newSetBinder(binder, ConnectorTableFunction.class);
+        tableFunctions.addBinding().to(Changes.class).in(Scopes.SINGLETON);
         tableFunctions.addBinding().toProvider(ExcludeColumns.class).in(Scopes.SINGLETON);
         tableFunctions.addBinding().toProvider(Sequence.class).in(Scopes.SINGLETON);
     }

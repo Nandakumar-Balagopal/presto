@@ -27,6 +27,7 @@ import com.facebook.presto.spi.connector.ConnectorTableVersion;
 import com.facebook.presto.spi.security.AllowAllAccessControl;
 import com.facebook.presto.testing.QueryRunner;
 import com.facebook.presto.tests.AbstractTestQueryFramework;
+import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.iceberg.BaseTable;
@@ -217,6 +218,27 @@ public class TestIcebergV3
             finally {
                 getQueryRunner().getTransactionManager().asyncAbort(refreshTransaction);
             }
+        }
+        finally {
+            dropTable(tableName);
+        }
+    }
+
+    @Test
+    public void testSystemChanges()
+            throws Exception
+    {
+        String tableName = "test_system_changes";
+        try {
+            assertUpdate("CREATE TABLE " + tableName + " (id integer, value varchar) WITH (\"format-version\" = '3')");
+            assertUpdate("INSERT INTO " + tableName + " VALUES (1, 'one')", 1);
+            long fromSnapshotId = loadTable(tableName).currentSnapshot().snapshotId();
+            assertUpdate("INSERT INTO " + tableName + " VALUES (2, 'two')", 1);
+            long toSnapshotId = loadTable(tableName).currentSnapshot().snapshotId();
+
+            assertQuery(
+                    "SELECT id, value, change_kind FROM TABLE(system.builtin.changes('" + ICEBERG_CATALOG + "." + TEST_SCHEMA + "." + tableName + "', " + fromSnapshotId + ", " + toSnapshotId + "))",
+                    "VALUES (2, 'two', 'INSERT')");
         }
         finally {
             dropTable(tableName);
