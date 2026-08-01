@@ -14,8 +14,10 @@
 package com.facebook.presto.sql.planner.iterative.rule.materializedview;
 
 import com.facebook.presto.Session;
+import com.facebook.presto.common.function.OperatorType;
 import com.facebook.presto.common.predicate.Domain;
 import com.facebook.presto.common.predicate.TupleDomain;
+import com.facebook.presto.common.type.BooleanType;
 import com.facebook.presto.metadata.Metadata;
 import com.facebook.presto.spi.ColumnHandle;
 import com.facebook.presto.spi.ColumnMetadata;
@@ -41,6 +43,7 @@ import com.facebook.presto.spi.plan.SortNode;
 import com.facebook.presto.spi.plan.TableScanNode;
 import com.facebook.presto.spi.plan.TopNNode;
 import com.facebook.presto.spi.plan.UnionNode;
+import com.facebook.presto.spi.relation.CallExpression;
 import com.facebook.presto.spi.relation.RowExpression;
 import com.facebook.presto.spi.relation.VariableReferenceExpression;
 import com.facebook.presto.sql.planner.iterative.GroupReference;
@@ -48,6 +51,7 @@ import com.facebook.presto.sql.planner.iterative.Lookup;
 import com.facebook.presto.sql.planner.optimizations.SetOperationNodeUtils;
 import com.facebook.presto.sql.planner.optimizations.SymbolMapper;
 import com.facebook.presto.sql.planner.plan.InternalPlanVisitor;
+import com.facebook.presto.sql.relational.FunctionResolution;
 import com.facebook.presto.sql.relational.RowExpressionDeterminismEvaluator;
 import com.facebook.presto.sql.relational.RowExpressionDomainTranslator;
 import com.google.common.collect.ImmutableList;
@@ -65,9 +69,11 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.function.Function;
 
+import static com.facebook.presto.expressions.LogicalRowExpressions.and;
 import static com.facebook.presto.expressions.LogicalRowExpressions.or;
 import static com.facebook.presto.spi.MaterializedViewStatus.MaterializedDataPredicates;
 import static com.facebook.presto.spi.StandardWarningCode.MATERIALIZED_VIEW_STITCHING_FALLBACK;
+import static com.facebook.presto.spi.plan.AggregationNode.Step.SINGLE;
 import static com.facebook.presto.spi.plan.JoinType.INNER;
 import static com.facebook.presto.sql.planner.optimizations.PlanNodeSearcher.searchFrom;
 import static com.facebook.presto.sql.relational.Expressions.not;
@@ -545,12 +551,108 @@ public class DifferentialPlanRewriter
 
             PlanVariants child = node.getSources().get(0).accept(this, context);
 
-            // ∆(γ(R)) = γ(∆R), γ(R') = γ(R'), γ(R) = γ(R)
+            NodeWithMapping delta = child.delta();
+            if (requiresExpandedDelta(node, child)) {
+                delta = buildExpandedDelta(node, child);
+            }
+
             return new PlanVariants(
-                    buildAggregation(node, child.delta()),
+                    buildAggregation(node, delta),
                     buildAggregation(node, child.current()),
                     buildAggregation(node, child.unchanged()),
                     Optional.empty());
+        }
+
+        private boolean requiresExpandedDelta(AggregationNode node, PlanVariants child)
+        {
+            if (node.getGroupingKeys().isEmpty()) {
+                return false;
+            }
+
+            Optional<Set<TableColumn>> closure = child.deltaClosureColumns();
+            if (!closure.isPresent()) {
+                return true;
+            }
+
+            Map<TableColumn, VariableReferenceExpression> sourceColumns =
+                    buildColumnToVariableMapping(metadata, session, node.getSource(), lookup);
+            Set<TableColumn> groupingColumns = sourceColumns.entrySet().stream()
+                    .filter(entry -> node.getGroupingKeys().contains(entry.getValue()))
+                    .map(Map.Entry::getKey)
+                    .collect(toImmutableSet());
+            return !groupingColumns.containsAll(closure.get());
+        }
+
+        private NodeWithMapping buildExpandedDelta(AggregationNode aggregation, PlanVariants child)
+        {
+            List<VariableReferenceExpression> deltaGroupingKeys = aggregation.getGroupingKeys().stream()
+                    .map(child.delta().getMapping()::get)
+                    .collect(toImmutableList());
+            List<VariableReferenceExpression> currentGroupingKeys = aggregation.getGroupingKeys().stream()
+                    .map(child.current().getMapping()::get)
+                    .collect(toImmutableList());
+
+            checkState(!deltaGroupingKeys.contains(null) && !currentGroupingKeys.contains(null),
+                    "Missing grouping-key mapping for expanded materialized view delta");
+
+            AggregationNode affectedGroups = new AggregationNode(
+                    aggregation.getSourceLocation(),
+                    idAllocator.getNextId(),
+                    child.delta().getNode(),
+                    ImmutableMap.of(),
+                    new AggregationNode.GroupingSetDescriptor(deltaGroupingKeys, 1, ImmutableSet.of()),
+                    ImmutableList.of(),
+                    SINGLE,
+                    Optional.empty(),
+                    Optional.empty(),
+                    Optional.empty());
+
+            FunctionResolution functionResolution = new FunctionResolution(metadata.getFunctionAndTypeManager().getFunctionAndTypeResolver());
+            List<RowExpression> matches = new ArrayList<>();
+            for (int index = 0; index < currentGroupingKeys.size(); index++) {
+                VariableReferenceExpression currentKey = currentGroupingKeys.get(index);
+                VariableReferenceExpression affectedKey = deltaGroupingKeys.get(index);
+                matches.add(new CallExpression(
+                        "NOT",
+                        functionResolution.notFunction(),
+                        BooleanType.BOOLEAN,
+                        ImmutableList.of(new CallExpression(
+                                OperatorType.IS_DISTINCT_FROM.name(),
+                                functionResolution.comparisonFunction(OperatorType.IS_DISTINCT_FROM, currentKey.getType(), affectedKey.getType()),
+                                BooleanType.BOOLEAN,
+                                ImmutableList.of(currentKey, affectedKey)))));
+            }
+
+            List<VariableReferenceExpression> joinOutputs = ImmutableList.<VariableReferenceExpression>builder()
+                    .addAll(child.current().getNode().getOutputVariables())
+                    .addAll(affectedGroups.getOutputVariables())
+                    .build();
+            JoinNode matchingRows = new JoinNode(
+                    aggregation.getSourceLocation(),
+                    idAllocator.getNextId(),
+                    INNER,
+                    child.current().getNode(),
+                    affectedGroups,
+                    ImmutableList.of(),
+                    joinOutputs,
+                    Optional.of(and(matches)),
+                    Optional.empty(),
+                    Optional.empty(),
+                    Optional.empty(),
+                    ImmutableMap.of());
+
+            Assignments.Builder assignments = Assignments.builder();
+            for (VariableReferenceExpression variable : child.current().getNode().getOutputVariables()) {
+                assignments.put(variable, variable);
+            }
+            return new NodeWithMapping(
+                    new ProjectNode(
+                            aggregation.getSourceLocation(),
+                            idAllocator.getNextId(),
+                            matchingRows,
+                            assignments.build(),
+                            ProjectNode.Locality.LOCAL),
+                    child.current().getMapping());
         }
 
         private NodeWithMapping buildAggregation(AggregationNode original, NodeWithMapping source)
