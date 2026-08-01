@@ -41,6 +41,7 @@ import com.facebook.presto.iceberg.procedure.context.IcebergCommonProcedureConte
 import com.facebook.presto.iceberg.statistics.StatisticsFileCache;
 import com.facebook.presto.iceberg.transaction.IcebergTransactionContext;
 import com.facebook.presto.iceberg.transaction.IcebergTransactionMetadata;
+import com.facebook.presto.spi.ChangeKindPageSource;
 import com.facebook.presto.spi.ChangedRowsPredicate;
 import com.facebook.presto.spi.ColumnHandle;
 import com.facebook.presto.spi.ColumnMetadata;
@@ -102,10 +103,11 @@ import io.airlift.slice.Slice;
 import org.apache.hadoop.fs.Path;
 import org.apache.iceberg.AppendFiles;
 import org.apache.iceberg.BaseTable;
+import org.apache.iceberg.ChangelogScanTask;
+import org.apache.iceberg.ContentScanTask;
 import org.apache.iceberg.DataFile;
 import org.apache.iceberg.DataFiles;
 import org.apache.iceberg.DeleteFiles;
-import org.apache.iceberg.ChangelogScanTask;
 import org.apache.iceberg.FileFormat;
 import org.apache.iceberg.FileMetadata;
 import org.apache.iceberg.FileScanTask;
@@ -351,6 +353,7 @@ public abstract class IcebergAbstractMetadata
     protected final IcebergTransactionContext transactionContext;
     protected final StatisticsFileCache statisticsFileCache;
     protected final IcebergTableProperties tableProperties;
+    private final IcebergPageSourceProvider pageSourceProvider;
     private final StandardFunctionResolution functionResolution;
     private static final JsonCodec<List<String>> STRING_LIST_CODEC = JsonCodec.listJsonCodec(String.class);
 
@@ -366,6 +369,7 @@ public abstract class IcebergAbstractMetadata
             FilterStatsCalculatorService filterStatsCalculatorService,
             StatisticsFileCache statisticsFileCache,
             IcebergTableProperties tableProperties,
+            IcebergPageSourceProvider pageSourceProvider,
             com.facebook.presto.spi.transaction.IsolationLevel isolationLevel,
             boolean autoCommitContext)
     {
@@ -380,6 +384,7 @@ public abstract class IcebergAbstractMetadata
         this.filterStatsCalculatorService = requireNonNull(filterStatsCalculatorService, "filterStatsCalculatorService is null");
         this.statisticsFileCache = requireNonNull(statisticsFileCache, "statisticsFileCache is null");
         this.tableProperties = requireNonNull(tableProperties, "tableProperties is null");
+        this.pageSourceProvider = requireNonNull(pageSourceProvider, "pageSourceProvider is null");
         this.transactionContext = new IcebergTransactionContext(isolationLevel, autoCommitContext);
     }
 
@@ -1420,6 +1425,72 @@ public abstract class IcebergAbstractMetadata
     }
 
     @Override
+    public ChangeKindPageSource getChangeSet(
+            ConnectorSession session,
+            ConnectorTableHandle tableHandle,
+            ConnectorTableVersion from,
+            ConnectorTableVersion to,
+            List<ColumnHandle> projectedDataColumns,
+            TupleDomain<ColumnHandle> filter)
+    {
+        IcebergTableHandle icebergTableHandle = (IcebergTableHandle) tableHandle;
+        Table icebergTable = getIcebergTable(session, icebergTableHandle.getSchemaTableName());
+        if (!supportsRowLineage(icebergTable)) {
+            throw new PrestoException(NOT_SUPPORTED, "Row-level change tracking requires an Iceberg V3 table with row lineage");
+        }
+
+        long fromSnapshotId = getSnapshotIdForTableVersion(icebergTable, from);
+        long toSnapshotId = getSnapshotIdForTableVersion(icebergTable, to);
+        if (!isAncestorOf(icebergTable, toSnapshotId, fromSnapshotId)) {
+            throw new PrestoException(NOT_SUPPORTED, "Row-level change tracking requires the refresh version to descend from the recorded version");
+        }
+
+        List<IcebergColumnHandle> columns = projectedDataColumns.stream()
+                .map(IcebergColumnHandle.class::cast)
+                .collect(toImmutableList());
+        TupleDomain<IcebergColumnHandle> icebergFilter = filter.transform(IcebergColumnHandle.class::cast);
+        IcebergTableHandle targetTableHandle = getTableHandle(session, icebergTableHandle.getSchemaTableName(), Optional.of(to));
+        IncrementalChangelogScan scan = icebergTable.newIncrementalChangelogScan()
+                .metricsReporter(new RuntimeStatsMetricsReporter(session.getRuntimeStats()))
+                .fromSnapshotExclusive(fromSnapshotId)
+                .toSnapshot(toSnapshotId);
+
+        return new IcebergChangeSetPageSource(
+                session,
+                typeManager,
+                pageSourceProvider,
+                icebergTable,
+                scan,
+                createChangeSetLayout(targetTableHandle, icebergTable, columns, icebergFilter),
+                columns);
+    }
+
+    private static IcebergTableLayoutHandle createChangeSetLayout(
+            IcebergTableHandle tableHandle,
+            Table table,
+            List<IcebergColumnHandle> columns,
+            TupleDomain<IcebergColumnHandle> filter)
+    {
+        Map<String, IcebergColumnHandle> predicateColumns = filter.getDomains()
+                .map(domains -> domains.keySet().stream()
+                        .collect(toImmutableMap(IcebergColumnHandle::getName, column -> column)))
+                .orElse(ImmutableMap.of());
+
+        return new IcebergTableLayoutHandle.Builder()
+                .setPartitionColumns(ImmutableList.of())
+                .setDataColumns(toHiveColumns(table.schema().columns()))
+                .setDomainPredicate(filter.transform(IcebergAbstractMetadata::toSubfield))
+                .setRemainingPredicate(TRUE_CONSTANT)
+                .setPredicateColumns(predicateColumns)
+                .setRequestedColumns(Optional.of(ImmutableSet.copyOf(columns)))
+                .setPushdownFilterEnabled(false)
+                .setPartitionColumnPredicate(TupleDomain.all())
+                .setPartitions(Optional.empty())
+                .setTable(tableHandle)
+                .build();
+    }
+
+    @Override
     public OptionalLong estimateChangeSetSize(ConnectorSession session, ConnectorTableHandle tableHandle, ConnectorTableVersion from, ConnectorTableVersion to)
     {
         IcebergTableHandle icebergTableHandle = (IcebergTableHandle) tableHandle;
@@ -1443,7 +1514,10 @@ public abstract class IcebergAbstractMetadata
         long sizeInBytes = 0;
         try (CloseableIterable<ChangelogScanTask> tasks = scan.planFiles()) {
             for (ChangelogScanTask task : tasks) {
-                sizeInBytes = Math.addExact(sizeInBytes, task.length());
+                if (!(task instanceof ContentScanTask)) {
+                    return OptionalLong.empty();
+                }
+                sizeInBytes = Math.addExact(sizeInBytes, ((ContentScanTask<?>) task).length());
             }
         }
         catch (IOException | ArithmeticException e) {

@@ -57,6 +57,7 @@ public class IcebergHiveMetadataFactory
     final ManifestFileCache manifestFileCache;
     final IcebergTableProperties tableProperties;
     final ConnectorSystemConfig connectorSystemConfig;
+    final IcebergPageSourceProvider pageSourceProvider;
     final long perTransactionCacheMaximumSize;
     final boolean metastoreImpersonationEnabled;
     final int metastorePartitionCacheMaxColumnCount;
@@ -80,6 +81,7 @@ public class IcebergHiveMetadataFactory
             ManifestFileCache manifestFileCache,
             IcebergTableProperties tableProperties,
             ConnectorSystemConfig connectorSystemConfig,
+            IcebergPageSourceProvider pageSourceProvider,
             MetastoreClientConfig metastoreClientConfig)
     {
         this.catalogName = requireNonNull(catalogName, "catalogName is null");
@@ -99,6 +101,7 @@ public class IcebergHiveMetadataFactory
         this.manifestFileCache = requireNonNull(manifestFileCache, "manifestFileCache is null");
         this.tableProperties = requireNonNull(tableProperties, "icebergTableProperties is null");
         this.connectorSystemConfig = requireNonNull(connectorSystemConfig, "connectorSystemConfig is null");
+        this.pageSourceProvider = requireNonNull(pageSourceProvider, "pageSourceProvider is null");
         requireNonNull(metastoreClientConfig, "metastoreClientConfig is null");
         this.perTransactionCacheMaximumSize = metastoreClientConfig.getPerTransactionMetastoreCacheMaximumSize();
         this.metastoreImpersonationEnabled = metastoreClientConfig.isMetastoreImpersonationEnabled();
@@ -132,6 +135,7 @@ public class IcebergHiveMetadataFactory
                 manifestFileCache,
                 tableProperties,
                 connectorSystemConfig,
+                pageSourceProvider,
                 isolationLevel,
                 autoCommitContext);
     }

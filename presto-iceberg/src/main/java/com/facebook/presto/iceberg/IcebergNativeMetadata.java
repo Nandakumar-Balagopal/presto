@@ -124,11 +124,12 @@ public class IcebergNativeMetadata
             FilterStatsCalculatorService filterStatsCalculatorService,
             StatisticsFileCache statisticsFileCache,
             IcebergTableProperties tableProperties,
+            IcebergPageSourceProvider pageSourceProvider,
             IsolationLevel isolationLevel,
             boolean autoCommitContext)
     {
         super(typeManager, procedureRegistry, functionResolution, rowExpressionService, commitTaskCodec, columnMappingsCodec, schemaTableNamesCodec,
-                nodeVersion, filterStatsCalculatorService, statisticsFileCache, tableProperties, isolationLevel, autoCommitContext);
+                nodeVersion, filterStatsCalculatorService, statisticsFileCache, tableProperties, pageSourceProvider, isolationLevel, autoCommitContext);
         this.catalogFactory = requireNonNull(catalogFactory, "catalogFactory is null");
         this.catalogType = requireNonNull(catalogType, "catalogType is null");
         this.warehouseDataDir = Optional.ofNullable(catalogFactory.getCatalogWarehouseDataDir());

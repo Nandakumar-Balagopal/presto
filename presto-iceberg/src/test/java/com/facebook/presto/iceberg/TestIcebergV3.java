@@ -13,6 +13,18 @@
  */
 package com.facebook.presto.iceberg;
 
+import com.facebook.presto.Session;
+import com.facebook.presto.common.Page;
+import com.facebook.presto.common.QualifiedObjectName;
+import com.facebook.presto.common.predicate.TupleDomain;
+import com.facebook.presto.common.transaction.TransactionId;
+import com.facebook.presto.metadata.Metadata;
+import com.facebook.presto.spi.ChangeKindPageSource;
+import com.facebook.presto.spi.ColumnHandle;
+import com.facebook.presto.spi.TableHandle;
+import com.facebook.presto.spi.analyzer.MetadataResolver;
+import com.facebook.presto.spi.connector.ConnectorTableVersion;
+import com.facebook.presto.spi.security.AllowAllAccessControl;
 import com.facebook.presto.testing.QueryRunner;
 import com.facebook.presto.tests.AbstractTestQueryFramework;
 import com.google.common.collect.ImmutableMap;
@@ -35,9 +47,13 @@ import org.testng.annotations.Test;
 
 import java.io.File;
 import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Map;
 import java.util.OptionalInt;
 
+import static com.facebook.presto.common.type.IntegerType.INTEGER;
+import static com.facebook.presto.common.type.VarcharType.VARCHAR;
 import static com.facebook.presto.iceberg.CatalogType.HADOOP;
 import static com.facebook.presto.iceberg.FileFormat.PARQUET;
 import static com.facebook.presto.iceberg.IcebergQueryRunner.ICEBERG_CATALOG;
@@ -137,6 +153,85 @@ public class TestIcebergV3
         finally {
             dropTable(tableName);
         }
+    }
+
+    @Test
+    public void testRowLevelChangeSet()
+            throws Exception
+    {
+        String tableName = "test_row_level_change_set";
+        try {
+            assertUpdate("CREATE TABLE " + tableName + " (id integer, value varchar) WITH (\"format-version\" = '3')");
+            assertUpdate("INSERT INTO " + tableName + " VALUES (1, 'one')", 1);
+
+            ConnectorTableVersion recordedVersion;
+            TransactionId recordedTransaction = getQueryRunner().getTransactionManager().beginTransaction(false);
+            try {
+                Session recordedSession = metadataSession(recordedTransaction);
+                TableHandle recordedHandle = getTableHandle(tableName, recordedSession);
+                recordedVersion = getQueryRunner().getMetadata().getCurrentTableVersion(recordedSession, recordedHandle).get();
+            }
+            finally {
+                getQueryRunner().getTransactionManager().asyncAbort(recordedTransaction);
+            }
+
+            assertUpdate("INSERT INTO " + tableName + " VALUES (2, 'two')", 1);
+
+            TransactionId refreshTransaction = getQueryRunner().getTransactionManager().beginTransaction(false);
+            try {
+                Session refreshSession = metadataSession(refreshTransaction);
+                Metadata metadata = getQueryRunner().getMetadata();
+                TableHandle tableHandle = getTableHandle(tableName, refreshSession);
+                ConnectorTableVersion refreshVersion = metadata.getCurrentTableVersion(refreshSession, tableHandle).get();
+                Map<String, ColumnHandle> columnHandles = metadata.getColumnHandles(refreshSession, tableHandle);
+                List<ColumnHandle> columns = ImmutableList.of(columnHandles.get("id"), columnHandles.get("value"));
+
+                ChangeKindPageSource pageSource = metadata.getChangeSet(
+                        refreshSession,
+                        tableHandle,
+                        recordedVersion,
+                        refreshVersion,
+                        columns,
+                        TupleDomain.all());
+                try {
+                    List<Integer> ids = new ArrayList<>();
+                    List<String> changeKinds = new ArrayList<>();
+                    while (!pageSource.isFinished()) {
+                        Page page = pageSource.getNextPage();
+                        if (page == null) {
+                            pageSource.isBlocked().get();
+                            continue;
+                        }
+                        for (int position = 0; position < page.getPositionCount(); position++) {
+                            ids.add((int) INTEGER.getLong(page.getBlock(0), position));
+                            changeKinds.add(VARCHAR.getSlice(page.getBlock(page.getChannelCount() - 1), position).toStringUtf8());
+                        }
+                    }
+                    assertEquals(ids, ImmutableList.of(2));
+                    assertEquals(changeKinds, ImmutableList.of("INSERT"));
+                }
+                finally {
+                    pageSource.close();
+                }
+            }
+            finally {
+                getQueryRunner().getTransactionManager().asyncAbort(refreshTransaction);
+            }
+        }
+        finally {
+            dropTable(tableName);
+        }
+    }
+
+    private Session metadataSession(TransactionId transactionId)
+    {
+        return getSession().beginTransactionId(transactionId, getQueryRunner().getTransactionManager(), new AllowAllAccessControl());
+    }
+
+    private TableHandle getTableHandle(String tableName, Session session)
+    {
+        MetadataResolver resolver = getQueryRunner().getMetadata().getMetadataResolver(session);
+        return resolver.getTableHandle(new QualifiedObjectName(session.getCatalog().get(), session.getSchema().get(), tableName)).get();
     }
 
     @Test

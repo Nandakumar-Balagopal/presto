@@ -48,6 +48,7 @@ public class IcebergNativeMetadataFactory
     final FilterStatsCalculatorService filterStatsCalculatorService;
     final StatisticsFileCache statisticsFileCache;
     final IcebergTableProperties tableProperties;
+    final IcebergPageSourceProvider pageSourceProvider;
 
     @Inject
     public IcebergNativeMetadataFactory(
@@ -63,7 +64,8 @@ public class IcebergNativeMetadataFactory
             NodeVersion nodeVersion,
             FilterStatsCalculatorService filterStatsCalculatorService,
             StatisticsFileCache statisticsFileCache,
-            IcebergTableProperties tableProperties)
+            IcebergTableProperties tableProperties,
+            IcebergPageSourceProvider pageSourceProvider)
     {
         this.catalogFactory = requireNonNull(catalogFactory, "catalogFactory is null");
         this.typeManager = requireNonNull(typeManager, "typeManager is null");
@@ -78,6 +80,7 @@ public class IcebergNativeMetadataFactory
         this.filterStatsCalculatorService = requireNonNull(filterStatsCalculatorService, "filterStatsCalculatorService is null");
         this.statisticsFileCache = requireNonNull(statisticsFileCache, "statisticsFileCache is null");
         this.tableProperties = requireNonNull(tableProperties, "tableProperties is null");
+        this.pageSourceProvider = requireNonNull(pageSourceProvider, "pageSourceProvider is null");
     }
 
     public IcebergTransactionMetadata create()
@@ -89,6 +92,6 @@ public class IcebergNativeMetadataFactory
     {
         return new IcebergNativeMetadata(catalogFactory, typeManager, procedureRegistry, functionResolution,
                 rowExpressionService, commitTaskCodec, columnMappingsCodec, schemaTableNamesCodec, catalogType, nodeVersion,
-                filterStatsCalculatorService, statisticsFileCache, tableProperties, isolationLevel, autoCommitContext);
+                filterStatsCalculatorService, statisticsFileCache, tableProperties, pageSourceProvider, isolationLevel, autoCommitContext);
     }
 }
