@@ -25,6 +25,7 @@ import com.facebook.presto.spi.SchemaTableName;
 import com.facebook.presto.spi.TableHandle;
 import com.facebook.presto.spi.VariableAllocator;
 import com.facebook.presto.spi.WarningCollector;
+import com.facebook.presto.spi.plan.AggregationNode;
 import com.facebook.presto.spi.plan.EquiJoinClause;
 import com.facebook.presto.spi.plan.ExceptNode;
 import com.facebook.presto.spi.plan.FilterNode;
@@ -35,6 +36,7 @@ import com.facebook.presto.spi.plan.Ordering;
 import com.facebook.presto.spi.plan.OrderingScheme;
 import com.facebook.presto.spi.plan.PlanNode;
 import com.facebook.presto.spi.plan.PlanNodeIdAllocator;
+import com.facebook.presto.spi.plan.ProjectNode;
 import com.facebook.presto.spi.plan.SortNode;
 import com.facebook.presto.spi.plan.TableScanNode;
 import com.facebook.presto.spi.plan.TopNNode;
@@ -45,6 +47,7 @@ import com.facebook.presto.testing.LocalQueryRunner;
 import com.facebook.presto.tpch.TpchConnectorFactory;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
+import com.google.common.collect.ImmutableSet;
 import org.testng.annotations.AfterClass;
 import org.testng.annotations.BeforeClass;
 import org.testng.annotations.Test;
@@ -444,6 +447,49 @@ public class TestDifferentialPlanRewriter
         FilterNode innerFilter = (FilterNode) outerFilter.getSource();
         assertTrue(innerFilter.getSource() instanceof TableScanNode,
                 "Inner filter should wrap TableScan. Got: " + innerFilter.getSource().getClass().getSimpleName());
+    }
+
+    @Test
+    public void testAggregationExpandsAffectedGroupsWhenStaleBoundaryIsNotGrouped()
+    {
+        TableScanNode orders = createOrdersTableScan();
+        AggregationNode aggregation = new AggregationNode(
+                Optional.empty(),
+                idAllocator.getNextId(),
+                orders,
+                ImmutableMap.of(),
+                new AggregationNode.GroupingSetDescriptor(
+                        ImmutableList.of(orders.getOutputVariables().get(0)),
+                        1,
+                        ImmutableSet.of()),
+                ImmutableList.of(),
+                AggregationNode.Step.SINGLE,
+                Optional.empty(),
+                Optional.empty(),
+                Optional.empty());
+
+        Map<SchemaTableName, List<TupleDomain<String>>> staleConstraints = ImmutableMap.of(
+                ORDERS_TABLE, ImmutableList.of(
+                        TupleDomain.withColumnDomains(ImmutableMap.of(
+                                "orderdate", Domain.singleValue(VARCHAR, utf8Slice("2024-01-01"))))));
+
+        DifferentialPlanRewriter builder = new DifferentialPlanRewriter(
+                metadata,
+                session,
+                idAllocator,
+                variableAllocator,
+                staleConstraints,
+                createSimplePassthroughColumnEquivalences(ORDERS_TABLE, "orderdate"),
+                lookup,
+                WarningCollector.NOOP);
+
+        DifferentialPlanRewriter.NodeWithMapping result = builder.buildDeltaPlan(aggregation, createIdentityMapping(aggregation.getOutputVariables()));
+
+        assertTrue(result.getNode() instanceof AggregationNode);
+        PlanNode expandedSource = ((AggregationNode) result.getNode()).getSource();
+        assertTrue(expandedSource instanceof ProjectNode, "Case B should project the current rows after matching affected groups");
+        assertTrue(((ProjectNode) expandedSource).getSource() instanceof JoinNode,
+                "Case B should match current rows to the affected groups");
     }
 
     // Helper methods
