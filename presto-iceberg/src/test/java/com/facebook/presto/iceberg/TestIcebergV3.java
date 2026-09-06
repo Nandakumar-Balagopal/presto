@@ -52,6 +52,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.OptionalInt;
+import java.util.OptionalLong;
 
 import static com.facebook.presto.common.type.IntegerType.INTEGER;
 import static com.facebook.presto.common.type.VarcharType.VARCHAR;
@@ -64,6 +65,7 @@ import static java.lang.String.format;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.testng.Assert.assertEquals;
 import static org.testng.Assert.assertNull;
+import static org.testng.Assert.assertTrue;
 
 public class TestIcebergV3
         extends AbstractTestQueryFramework
@@ -186,6 +188,10 @@ public class TestIcebergV3
                 ConnectorTableVersion refreshVersion = metadata.getCurrentTableVersion(refreshSession, tableHandle).get();
                 Map<String, ColumnHandle> columnHandles = metadata.getColumnHandles(refreshSession, tableHandle);
                 List<ColumnHandle> columns = ImmutableList.of(columnHandles.get("id"), columnHandles.get("value"));
+
+                OptionalLong estimatedSize = metadata.estimateChangeSetSize(refreshSession, tableHandle, recordedVersion, refreshVersion);
+                assertTrue(estimatedSize.isPresent());
+                assertTrue(estimatedSize.getAsLong() > 0);
 
                 ChangeKindPageSource pageSource = metadata.getChangeSet(
                         refreshSession,
