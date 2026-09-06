@@ -527,6 +527,8 @@ public interface Metadata
      */
     MaterializedViewStatus getMaterializedViewStatus(Session session, QualifiedObjectName viewName, TupleDomain<String> baseQueryDomain);
 
+    boolean supportsMaterializedViewRowLevelRefresh(Session session, TableHandle materializedViewTable);
+
     /**
      * Try to locate a table index that can lookup results by indexableColumns and provide the requested outputColumns.
      */

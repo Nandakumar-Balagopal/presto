@@ -541,6 +541,12 @@ public abstract class DelegatingMetadataManager
     }
 
     @Override
+    public boolean supportsMaterializedViewRowLevelRefresh(Session session, TableHandle materializedViewTable)
+    {
+        return delegate.supportsMaterializedViewRowLevelRefresh(session, materializedViewTable);
+    }
+
+    @Override
     public void createView(Session session, String catalogName, ConnectorTableMetadata viewMetadata, String viewData, boolean replace)
     {
         delegate.createView(session, catalogName, viewMetadata, viewData, replace);

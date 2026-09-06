@@ -638,6 +638,14 @@ public class ClassLoaderSafeConnectorMetadata
     }
 
     @Override
+    public boolean supportsMaterializedViewRowLevelRefresh(ConnectorSession session, ConnectorTableHandle materializedViewTable)
+    {
+        try (ThreadContextClassLoader ignored = new ThreadContextClassLoader(classLoader)) {
+            return delegate.supportsMaterializedViewRowLevelRefresh(session, materializedViewTable);
+        }
+    }
+
+    @Override
     public Optional<ConnectorTableVersion> getCurrentTableVersion(ConnectorSession session, ConnectorTableHandle table)
     {
         try (ThreadContextClassLoader ignored = new ThreadContextClassLoader(classLoader)) {

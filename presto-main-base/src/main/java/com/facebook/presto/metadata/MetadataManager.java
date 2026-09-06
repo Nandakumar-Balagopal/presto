@@ -1442,6 +1442,16 @@ public class MetadataManager
     }
 
     @Override
+    public boolean supportsMaterializedViewRowLevelRefresh(Session session, TableHandle materializedViewTable)
+    {
+        ConnectorId connectorId = materializedViewTable.getConnectorId();
+        ConnectorMetadata metadata = getMetadata(session, connectorId);
+        return metadata.supportsMaterializedViewRowLevelRefresh(
+                session.toConnectorSession(connectorId),
+                materializedViewTable.getConnectorHandle());
+    }
+
+    @Override
     public InsertTableHandle beginRefreshMaterializedView(Session session, TableHandle tableHandle, Optional<RowExpression> refreshScopePredicate)
     {
         ConnectorId connectorId = tableHandle.getConnectorId();

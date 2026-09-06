@@ -702,6 +702,12 @@ public class StatsRecordingMetadataManager
     }
 
     @Override
+    public boolean supportsMaterializedViewRowLevelRefresh(Session session, TableHandle materializedViewTable)
+    {
+        return delegate.supportsMaterializedViewRowLevelRefresh(session, materializedViewTable);
+    }
+
+    @Override
     public Optional<ResolvedIndex> resolveIndex(Session session, TableHandle tableHandle, Set<ColumnHandle> indexableColumns, Set<ColumnHandle> outputColumns, TupleDomain<ColumnHandle> tupleDomain)
     {
         long startTime = System.nanoTime();

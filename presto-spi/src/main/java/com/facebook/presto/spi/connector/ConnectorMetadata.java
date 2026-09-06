@@ -838,6 +838,15 @@ public interface ConnectorMetadata
     }
 
     /**
+     * Returns whether the connector can atomically remove and replace affected MV rows/groups.
+     * Connectors must opt in before the engine enables row-level MV refresh planning.
+     */
+    default boolean supportsMaterializedViewRowLevelRefresh(ConnectorSession session, ConnectorTableHandle materializedViewTable)
+    {
+        return false;
+    }
+
+    /**
      * Returns the version embedded in a table handle when the connector supports row-level change tracking.
      */
     default Optional<ConnectorTableVersion> getCurrentTableVersion(ConnectorSession session, ConnectorTableHandle table)
