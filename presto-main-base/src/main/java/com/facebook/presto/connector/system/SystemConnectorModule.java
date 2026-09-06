@@ -77,6 +77,7 @@ public class SystemConnectorModule
         Multibinder.newSetBinder(binder, Procedure.class);
 
         binder.bind(KillQueryProcedure.class).in(Scopes.SINGLETON);
+        binder.bind(Changes.class).in(Scopes.SINGLETON);
 
         binder.bind(GlobalSystemConnectorFactory.class).in(Scopes.SINGLETON);
         binder.bind(SystemConnectorRegistrar.class).asEagerSingleton();
