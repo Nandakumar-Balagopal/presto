@@ -14,7 +14,7 @@
 package com.facebook.presto.iceberg;
 
 import com.facebook.presto.hive.HiveCompressionCodec;
-import com.facebook.presto.spi.ConnectorInsertTableHandle;
+import com.facebook.presto.spi.ConnectorRefreshMaterializedViewHandle;
 import com.facebook.presto.spi.SchemaTableName;
 import com.fasterxml.jackson.annotation.JsonCreator;
 import com.fasterxml.jackson.annotation.JsonProperty;
@@ -28,7 +28,7 @@ import static java.util.Objects.requireNonNull;
 
 public class IcebergInsertTableHandle
         extends IcebergWritableTableHandle
-        implements ConnectorInsertTableHandle
+        implements ConnectorRefreshMaterializedViewHandle
 {
     private final List<String> insertedColumns;
 
