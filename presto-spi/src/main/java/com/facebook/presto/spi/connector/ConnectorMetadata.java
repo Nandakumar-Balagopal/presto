@@ -907,6 +907,15 @@ public interface ConnectorMetadata
     }
 
     /**
+     * Finish a refresh using a connector refresh handle.  The default preserves
+     * compatibility with connectors that only implement insert refreshes.
+     */
+    default Optional<ConnectorOutputMetadata> finishRefreshMaterializedView(ConnectorSession session, ConnectorRefreshMaterializedViewHandle refreshHandle, Collection<Slice> fragments, Collection<ComputedStatistics> computedStatistics)
+    {
+        return finishRefreshMaterializedView(session, (ConnectorInsertTableHandle) refreshHandle, fragments, computedStatistics);
+    }
+
+    /**
      * Gets the referenced materialized views for a give table
      */
     default Optional<List<SchemaTableName>> getReferencedMaterializedViews(ConnectorSession session, SchemaTableName tableName)
