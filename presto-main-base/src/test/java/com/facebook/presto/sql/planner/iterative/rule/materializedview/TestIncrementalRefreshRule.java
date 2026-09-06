@@ -147,6 +147,23 @@ public class TestIncrementalRefreshRule
                 .matches(values("id", "ds"));
     }
 
+    @Test
+    public void testFallsBackToFullRefreshWhenPartitionEntryHasNoPredicates()
+    {
+        MaterializedViewStatus status = new MaterializedViewStatus(
+                PARTIALLY_MATERIALIZED,
+                ImmutableMap.of(BASE_TABLE, new MaterializedDataPredicates(ImmutableList.of(), ImmutableList.of())),
+                Optional.empty());
+        Metadata metadata = new TestingMetadataForIncrementalRefresh(
+                tester().getMetadata(),
+                createSimpleMvDefinition(),
+                status);
+
+        tester().assertThat(new IncrementalRefreshRule(metadata))
+                .on(this::buildRefreshPlan)
+                .matches(values("id", "ds"));
+    }
+
     @Test(expectedExceptions = PrestoException.class, expectedExceptionsMessageRegExp = "Materialized view not found:.*")
     public void testThrowsWhenMvDefinitionNotFound()
     {
