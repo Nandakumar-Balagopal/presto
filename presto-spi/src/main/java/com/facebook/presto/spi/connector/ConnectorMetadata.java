@@ -916,6 +916,18 @@ public interface ConnectorMetadata
     }
 
     /**
+     * Finish a refresh with separate delete and insert commit fragments.  The
+     * default rejects delete fragments so they can never be silently ignored.
+     */
+    default Optional<ConnectorOutputMetadata> finishRefreshMaterializedView(ConnectorSession session, ConnectorRefreshMaterializedViewHandle refreshHandle, Collection<Slice> deleteFragments, Collection<Slice> insertFragments, Collection<ComputedStatistics> computedStatistics)
+    {
+        if (!deleteFragments.isEmpty()) {
+            throw new PrestoException(NOT_SUPPORTED, "Connector does not support atomic delete and insert materialized view refresh");
+        }
+        return finishRefreshMaterializedView(session, refreshHandle, insertFragments, computedStatistics);
+    }
+
+    /**
      * Gets the referenced materialized views for a give table
      */
     default Optional<List<SchemaTableName>> getReferencedMaterializedViews(ConnectorSession session, SchemaTableName tableName)
