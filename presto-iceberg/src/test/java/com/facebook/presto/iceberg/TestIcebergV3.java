@@ -245,6 +245,9 @@ public class TestIcebergV3
             assertQuery(
                     "SELECT id, value, change_kind FROM TABLE(system.builtin.changes('" + ICEBERG_CATALOG + "." + TEST_SCHEMA + "." + tableName + "', " + fromSnapshotId + ", " + toSnapshotId + "))",
                     "VALUES (2, 'two', 'INSERT')");
+            assertQuery(
+                    "SELECT count(*) FROM TABLE(system.builtin.changes('" + ICEBERG_CATALOG + "." + TEST_SCHEMA + "." + tableName + "', " + fromSnapshotId + ", " + toSnapshotId + ", true)) WHERE \"$row_id\" IS NOT NULL",
+                    "SELECT 1");
         }
         finally {
             dropTable(tableName);
