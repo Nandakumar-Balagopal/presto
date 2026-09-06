@@ -164,6 +164,30 @@ public class TestIncrementalRefreshRule
                 .matches(values("id", "ds"));
     }
 
+    @Test
+    public void testFallsBackWhenStorageDoesNotSupportAtomicRowReplacement()
+    {
+        MaterializedViewStatus status = new MaterializedViewStatus(
+                PARTIALLY_MATERIALIZED,
+                ImmutableMap.of(
+                        BASE_TABLE,
+                        new MaterializedDataPredicates(
+                                ImmutableList.of(TupleDomain.withColumnDomains(
+                                        ImmutableMap.of("ds", Domain.singleValue(VARCHAR, utf8Slice("2024-01-03"))))),
+                                ImmutableList.of("ds"))),
+                Optional.empty(),
+                ImmutableMap.of(BASE_TABLE, new TestingTableHandle()),
+                ImmutableMap.of(BASE_TABLE, ChangedRowsPredicate.empty()));
+        Metadata metadata = new TestingMetadataForIncrementalRefresh(
+                tester().getMetadata(),
+                createSimpleMvDefinition(),
+                status);
+
+        tester().assertThat(new IncrementalRefreshRule(metadata))
+                .on(this::buildRefreshPlan)
+                .matches(values("id", "ds"));
+    }
+
     @Test(expectedExceptions = PrestoException.class, expectedExceptionsMessageRegExp = "Materialized view not found:.*")
     public void testThrowsWhenMvDefinitionNotFound()
     {
