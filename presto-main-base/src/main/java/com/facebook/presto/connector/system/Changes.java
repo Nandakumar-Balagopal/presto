@@ -203,20 +203,35 @@ public class Changes
 
     private static String requireVarcharArgument(Map<String, Argument> arguments, String name)
     {
-        Object value = ((ScalarArgument) arguments.get(name)).getValue();
+        Object value = requireScalarArgument(arguments, name);
         if (value == null) {
             throw new PrestoException(INVALID_FUNCTION_ARGUMENT, name + " is null");
+        }
+        if (!(value instanceof Slice)) {
+            throw new PrestoException(INVALID_FUNCTION_ARGUMENT, name + " must be a varchar");
         }
         return ((Slice) value).toStringUtf8();
     }
 
     private static long requireBigintArgument(Map<String, Argument> arguments, String name)
     {
-        Object value = ((ScalarArgument) arguments.get(name)).getValue();
+        Object value = requireScalarArgument(arguments, name);
         if (value == null) {
             throw new PrestoException(INVALID_FUNCTION_ARGUMENT, name + " is null");
         }
+        if (!(value instanceof Long)) {
+            throw new PrestoException(INVALID_FUNCTION_ARGUMENT, name + " must be a bigint");
+        }
         return (long) value;
+    }
+
+    private static Object requireScalarArgument(Map<String, Argument> arguments, String name)
+    {
+        Argument argument = arguments.get(name);
+        if (!(argument instanceof ScalarArgument)) {
+            throw new PrestoException(INVALID_FUNCTION_ARGUMENT, name + " must be a scalar argument");
+        }
+        return ((ScalarArgument) argument).getValue();
     }
 
     public static class ChangesFunctionHandle
