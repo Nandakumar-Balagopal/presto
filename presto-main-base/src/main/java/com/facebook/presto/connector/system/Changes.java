@@ -172,6 +172,12 @@ public class Changes
             if (rowIdHandle == null) {
                 throw new PrestoException(NOT_SUPPORTED, "TABLE does not expose a row lineage column");
             }
+            accessControl.checkCanSelectFromColumns(
+                    engineSession.getRequiredTransactionId(),
+                    engineSession.getIdentity(),
+                    engineSession.getAccessControlContext(),
+                    QualifiedObjectName.valueOf(tableName),
+                    ImmutableSet.of(new Subfield("$row_id", ImmutableList.of())));
             projectedColumns.add(rowIdHandle);
             outputColumns.add(new Descriptor.Field("$row_id", Optional.of(metadata.getMetadataResolver(engineSession).getColumnMetadata(tableHandle, rowIdHandle).getType())));
         }
