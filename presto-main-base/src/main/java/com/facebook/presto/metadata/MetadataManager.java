@@ -1479,6 +1479,21 @@ public class MetadataManager
     }
 
     @Override
+    public Optional<ConnectorOutputMetadata> finishRefreshMaterializedView(Session session, InsertTableHandle tableHandle, Collection<Slice> deleteFragments, Collection<Slice> insertFragments, Collection<ComputedStatistics> computedStatistics)
+    {
+        ConnectorId connectorId = tableHandle.getConnectorId();
+        ConnectorMetadata metadata = getMetadataForWrite(session, connectorId);
+        ConnectorInsertTableHandle connectorHandle = tableHandle.getConnectorHandle();
+        if (!(connectorHandle instanceof ConnectorRefreshMaterializedViewHandle)) {
+            if (!deleteFragments.isEmpty()) {
+                throw new PrestoException(NOT_SUPPORTED, "Atomic delete and insert materialized view refresh is not supported");
+            }
+            return metadata.finishRefreshMaterializedView(session.toConnectorSession(connectorId), connectorHandle, insertFragments, computedStatistics);
+        }
+        return metadata.finishRefreshMaterializedView(session.toConnectorSession(connectorId), (ConnectorRefreshMaterializedViewHandle) connectorHandle, deleteFragments, insertFragments, computedStatistics);
+    }
+
+    @Override
     public List<QualifiedObjectName> getReferencedMaterializedViews(Session session, QualifiedObjectName tableName)
     {
         requireNonNull(tableName, "tableName is null");
