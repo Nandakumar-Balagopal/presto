@@ -143,6 +143,14 @@ public class IncrementalRefreshRule
 
         MaterializedViewStatus status = metadataResolver.getMaterializedViewStatus(qualifiedViewName, TupleDomain.all());
 
+        if (status.hasRowLevelChanges() && !metadata.supportsMaterializedViewRowLevelRefresh(session, storageTableHandle)) {
+            context.getWarningCollector().add(new PrestoWarning(
+                    MATERIALIZED_VIEW_STITCHING_FALLBACK,
+                    "Cannot perform row-level incremental refresh for materialized view " + qualifiedViewName +
+                            ": the storage connector does not support atomic affected-row replacement. Falling back to full refresh."));
+            return Result.ofPlanNode(node.getSource());
+        }
+
         // If fully materialized, nothing to refresh - return empty result
         if (status.isFullyMaterialized()) {
             return Result.ofPlanNode(new ValuesNode(
