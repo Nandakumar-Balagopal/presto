@@ -165,7 +165,7 @@ public class IncrementalRefreshRule
         // If no partition info available (unpartitioned tables or connector doesn't track partitions),
         // fall back to full refresh since we can't determine which partitions are stale
         if (status.getPartitionsFromBaseTables().isEmpty()) {
-            String reason = status.getChangedRowsPredicates().isEmpty()
+            String reason = !status.hasRowLevelChanges()
                     ? "no partition-level staleness available (unpartitioned base, untracked partitions, or non-append base changes)"
                     : "row-level changes are available but affected-identifier storage stitching is not supported for this materialized view";
             context.getWarningCollector().add(new PrestoWarning(

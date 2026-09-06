@@ -169,4 +169,14 @@ public class MaterializedViewStatus
     {
         return changedRowsPredicates;
     }
+
+    /**
+     * Returns whether at least one base table has connector-provided row-level change metadata.
+     * This is intentionally separate from partition staleness: callers must still verify that
+     * the MV storage layout can consume affected identifiers before enabling row-level refresh.
+     */
+    public boolean hasRowLevelChanges()
+    {
+        return !changedRowsPredicates.isEmpty();
+    }
 }
