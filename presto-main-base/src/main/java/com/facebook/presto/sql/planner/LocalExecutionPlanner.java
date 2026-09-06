@@ -62,6 +62,7 @@ import com.facebook.presto.operator.EnforceSingleRowOperator;
 import com.facebook.presto.operator.ExplainAnalyzeOperator.ExplainAnalyzeOperatorFactory;
 import com.facebook.presto.operator.FilterAndProjectOperator.FilterAndProjectOperatorFactory;
 import com.facebook.presto.operator.FragmentResultCacheManager;
+import com.facebook.presto.operator.RefreshMaterializedViewCommit;
 import com.facebook.presto.operator.GroupIdOperator;
 import com.facebook.presto.operator.HashAggregationOperator.HashAggregationOperatorFactory;
 import com.facebook.presto.operator.HashBuilderOperator.HashBuilderOperatorFactory;
@@ -3692,7 +3693,11 @@ public class LocalExecutionPlanner
 
     private static TableFinisher createTableFinisher(Session session, Metadata metadata, ExecutionWriterTarget target)
     {
-        return (fragments, statistics) -> {
+        return new TableFinisher()
+        {
+            @Override
+            public Optional<ConnectorOutputMetadata> finishTable(Collection<Slice> fragments, Collection<ComputedStatistics> statistics)
+            {
             if (target instanceof CreateHandle) {
                 return metadata.finishCreateTable(session, ((CreateHandle) target).getHandle(), fragments, statistics);
             }
@@ -3719,6 +3724,16 @@ public class LocalExecutionPlanner
             }
             else {
                 throw new AssertionError("Unhandled target type: " + target.getClass().getName());
+            }
+            }
+
+            @Override
+            public Optional<ConnectorOutputMetadata> finishRefreshMaterializedView(RefreshMaterializedViewCommit commit, Collection<ComputedStatistics> statistics)
+            {
+                if (target instanceof RefreshMaterializedViewHandle) {
+                    return metadata.finishRefreshMaterializedView(session, ((RefreshMaterializedViewHandle) target).getHandle(), commit.getDeleteFragments(), commit.getInsertFragments(), statistics);
+                }
+                return finishTable(commit.getInsertFragments(), statistics);
             }
         };
     }
