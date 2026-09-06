@@ -34,6 +34,7 @@ import com.facebook.presto.spi.ConnectorDeleteTableHandle;
 import com.facebook.presto.spi.ConnectorDistributedProcedureHandle;
 import com.facebook.presto.spi.ConnectorId;
 import com.facebook.presto.spi.ConnectorInsertTableHandle;
+import com.facebook.presto.spi.ConnectorRefreshMaterializedViewHandle;
 import com.facebook.presto.spi.ConnectorMergeTableHandle;
 import com.facebook.presto.spi.ConnectorOutputTableHandle;
 import com.facebook.presto.spi.ConnectorResolvedIndex;
@@ -1470,7 +1471,11 @@ public class MetadataManager
         // beginRefreshMaterializedView (some connectors, e.g. Prism, return distinct read/write
         // instances); this lets a connector read state set during begin (e.g. the refresh scope).
         ConnectorMetadata metadata = getMetadataForWrite(session, connectorId);
-        return metadata.finishRefreshMaterializedView(session.toConnectorSession(connectorId), tableHandle.getConnectorHandle(), fragments, computedStatistics);
+        ConnectorInsertTableHandle connectorHandle = tableHandle.getConnectorHandle();
+        if (connectorHandle instanceof ConnectorRefreshMaterializedViewHandle) {
+            return metadata.finishRefreshMaterializedView(session.toConnectorSession(connectorId), (ConnectorRefreshMaterializedViewHandle) connectorHandle, fragments, computedStatistics);
+        }
+        return metadata.finishRefreshMaterializedView(session.toConnectorSession(connectorId), connectorHandle, fragments, computedStatistics);
     }
 
     @Override
