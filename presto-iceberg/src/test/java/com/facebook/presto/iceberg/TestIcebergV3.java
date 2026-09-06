@@ -245,6 +245,27 @@ public class TestIcebergV3
         }
     }
 
+    @Test
+    public void testSystemChangesIncludesDeletedRows()
+            throws Exception
+    {
+        String tableName = "test_system_changes_delete";
+        try {
+            assertUpdate("CREATE TABLE " + tableName + " (id integer, value varchar) WITH (\"format-version\" = '3')");
+            assertUpdate("INSERT INTO " + tableName + " VALUES (1, 'one'), (2, 'two')", 2);
+            long fromSnapshotId = loadTable(tableName).currentSnapshot().snapshotId();
+            assertUpdate("DELETE FROM " + tableName, 2);
+            long toSnapshotId = loadTable(tableName).currentSnapshot().snapshotId();
+
+            assertQuery(
+                    "SELECT id, value, change_kind FROM TABLE(system.builtin.changes('" + ICEBERG_CATALOG + "." + TEST_SCHEMA + "." + tableName + "', " + fromSnapshotId + ", " + toSnapshotId + ")) ORDER BY id",
+                    "VALUES (1, 'one', 'DELETE'), (2, 'two', 'DELETE')");
+        }
+        finally {
+            dropTable(tableName);
+        }
+    }
+
     private Session metadataSession(TransactionId transactionId)
     {
         return getSession().beginTransactionId(transactionId, getQueryRunner().getTransactionManager(), new AllowAllAccessControl());
