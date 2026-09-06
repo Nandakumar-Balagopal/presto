@@ -2694,9 +2694,7 @@ public abstract class IcebergAbstractMetadata
         SchemaTableName materializedViewName = icebergTableHandle.getMaterializedViewName().get();
         MaterializedViewStatus status = getMaterializedViewStatus(session, materializedViewName, TupleDomain.all());
         boolean fullRefreshRequired = !status.isFullyMaterialized()
-                && (status.getPartitionsFromBaseTables().isEmpty()
-                || status.getPartitionsFromBaseTables().values().stream()
-                .anyMatch(p -> p.getPredicateDisjuncts().isEmpty()));
+                && !status.hasPartitionRefreshData();
 
         return new IcebergInsertTableHandle(
                 storageTableHandle.getSchemaName(),

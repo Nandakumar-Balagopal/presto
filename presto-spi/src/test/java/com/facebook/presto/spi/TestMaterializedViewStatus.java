@@ -34,6 +34,7 @@ public class TestMaterializedViewStatus
         assertTrue(status.getRecordedBaseTableHandles().isEmpty());
         assertTrue(status.getChangedRowsPredicates().isEmpty());
         assertTrue(!status.hasRowLevelChanges());
+        assertTrue(!status.hasPartitionRefreshData());
     }
 
     @Test
@@ -54,5 +55,6 @@ public class TestMaterializedViewStatus
         assertTrue(status.getChangedRowsPredicates().containsKey(baseTable));
         assertTrue(status.getChangedRowsPredicates().get(baseTable).getDataDisjuncts().isEmpty());
         assertTrue(status.hasRowLevelChanges());
+        assertTrue(!status.hasPartitionRefreshData());
     }
 }

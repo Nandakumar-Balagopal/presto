@@ -179,4 +179,13 @@ public class MaterializedViewStatus
     {
         return !changedRowsPredicates.isEmpty();
     }
+
+    /**
+     * Returns whether the connector supplied a usable partition refresh scope for every stale base.
+     */
+    public boolean hasPartitionRefreshData()
+    {
+        return !partitionsFromBaseTables.isEmpty() && partitionsFromBaseTables.values().stream()
+                .noneMatch(MaterializedDataPredicates::isEmpty);
+    }
 }
