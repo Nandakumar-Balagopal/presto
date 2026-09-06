@@ -49,6 +49,7 @@ import com.facebook.presto.spi.ConnectorDeleteTableHandle;
 import com.facebook.presto.spi.ConnectorDistributedProcedureHandle;
 import com.facebook.presto.spi.ConnectorId;
 import com.facebook.presto.spi.ConnectorInsertTableHandle;
+import com.facebook.presto.spi.ConnectorRefreshMaterializedViewHandle;
 import com.facebook.presto.spi.ConnectorMergeTableHandle;
 import com.facebook.presto.spi.ConnectorNewTableLayout;
 import com.facebook.presto.spi.ConnectorOutputTableHandle;
@@ -2709,6 +2710,18 @@ public abstract class IcebergAbstractMetadata
                 getSupportedSortFields(storageTable.schema(), storageTable.sortOrder()),
                 Optional.of(materializedViewName),
                 fullRefreshRequired);
+    }
+
+    @Override
+    public Optional<ConnectorOutputMetadata> finishRefreshMaterializedView(
+            ConnectorSession session,
+            ConnectorRefreshMaterializedViewHandle refreshHandle,
+            Collection<Slice> fragments,
+            Collection<ComputedStatistics> computedStatistics)
+    {
+        // The insert-only implementation remains the compatibility path until the
+        // execution layer supplies delete fragments alongside recomputed rows.
+        return finishRefreshMaterializedView(session, (ConnectorInsertTableHandle) refreshHandle, fragments, computedStatistics);
     }
 
     @Override
