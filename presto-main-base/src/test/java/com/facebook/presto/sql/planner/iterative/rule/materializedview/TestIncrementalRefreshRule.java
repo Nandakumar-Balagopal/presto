@@ -20,6 +20,7 @@ import com.facebook.presto.common.predicate.TupleDomain;
 import com.facebook.presto.metadata.AbstractMockMetadata;
 import com.facebook.presto.metadata.FunctionAndTypeManager;
 import com.facebook.presto.metadata.Metadata;
+import com.facebook.presto.spi.ChangedRowsPredicate;
 import com.facebook.presto.spi.ColumnHandle;
 import com.facebook.presto.spi.ColumnMetadata;
 import com.facebook.presto.spi.ConnectorId;
@@ -121,6 +122,25 @@ public class TestIncrementalRefreshRule
                 tester().getMetadata(),
                 createSimpleMvDefinition(),
                 new MaterializedViewStatus(PARTIALLY_MATERIALIZED, ImmutableMap.of(), Optional.empty()));
+
+        tester().assertThat(new IncrementalRefreshRule(metadata))
+                .on(this::buildRefreshPlan)
+                .matches(values("id", "ds"));
+    }
+
+    @Test
+    public void testFallsBackToFullRefreshWhenRowChangesHaveNoStorageIdentifierPath()
+    {
+        MaterializedViewStatus status = new MaterializedViewStatus(
+                PARTIALLY_MATERIALIZED,
+                ImmutableMap.of(),
+                Optional.empty(),
+                ImmutableMap.of(BASE_TABLE, new TestingTableHandle()),
+                ImmutableMap.of(BASE_TABLE, ChangedRowsPredicate.empty()));
+        Metadata metadata = new TestingMetadataForIncrementalRefresh(
+                tester().getMetadata(),
+                createSimpleMvDefinition(),
+                status);
 
         tester().assertThat(new IncrementalRefreshRule(metadata))
                 .on(this::buildRefreshPlan)
