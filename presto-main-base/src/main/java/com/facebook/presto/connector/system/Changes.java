@@ -21,6 +21,7 @@ import com.facebook.presto.common.Subfield;
 import com.facebook.presto.common.predicate.TupleDomain;
 import com.facebook.presto.common.transaction.TransactionId;
 import com.facebook.presto.common.type.BigintType;
+import com.facebook.presto.common.type.BooleanType;
 import com.facebook.presto.common.type.TimeZoneKey;
 import com.facebook.presto.metadata.InternalNodeManager;
 import com.facebook.presto.metadata.Metadata;
@@ -98,6 +99,7 @@ public class Changes
     private static final String TABLE_ARGUMENT = "TABLE";
     private static final String FROM_ARGUMENT = "FROM_VERSION";
     private static final String TO_ARGUMENT = "TO_VERSION";
+    private static final String INCLUDE_ROW_ID_ARGUMENT = "INCLUDE_ROW_ID";
 
     private final Metadata metadata;
     private final InternalNodeManager nodeManager;
@@ -112,7 +114,8 @@ public class Changes
                 ImmutableList.of(
                         ScalarArgumentSpecification.builder().name(TABLE_ARGUMENT).type(VARCHAR).build(),
                         ScalarArgumentSpecification.builder().name(FROM_ARGUMENT).type(BigintType.BIGINT).build(),
-                        ScalarArgumentSpecification.builder().name(TO_ARGUMENT).type(BigintType.BIGINT).build()),
+                        ScalarArgumentSpecification.builder().name(TO_ARGUMENT).type(BigintType.BIGINT).build(),
+                        ScalarArgumentSpecification.builder().name(INCLUDE_ROW_ID_ARGUMENT).type(BooleanType.BOOLEAN).defaultValue(false).build()),
                 GenericTableReturnTypeSpecification.GENERIC_TABLE);
         this.metadata = requireNonNull(metadata, "metadata is null");
         this.nodeManager = requireNonNull(nodeManager, "nodeManager is null");
@@ -125,6 +128,7 @@ public class Changes
         String tableName = requireVarcharArgument(arguments, TABLE_ARGUMENT);
         long fromVersion = requireBigintArgument(arguments, FROM_ARGUMENT);
         long toVersion = requireBigintArgument(arguments, TO_ARGUMENT);
+        boolean includeRowId = requireBooleanArgument(arguments, INCLUDE_ROW_ID_ARGUMENT);
         if (fromVersion > toVersion) {
             throw new PrestoException(INVALID_FUNCTION_ARGUMENT, "FROM_VERSION must not be greater than TO_VERSION");
         }
@@ -162,6 +166,14 @@ public class Changes
             }
             projectedColumns.add(columnHandle);
             outputColumns.add(new Descriptor.Field(column.getName(), Optional.of(column.getType())));
+        }
+        if (includeRowId) {
+            ColumnHandle rowIdHandle = columnHandles.get("$row_id");
+            if (rowIdHandle == null) {
+                throw new PrestoException(NOT_SUPPORTED, "TABLE does not expose a row lineage column");
+            }
+            projectedColumns.add(rowIdHandle);
+            outputColumns.add(new Descriptor.Field("$row_id", Optional.of(metadata.getMetadataResolver(engineSession).getColumnMetadata(tableHandle, rowIdHandle).getType())));
         }
         outputColumns.add(new Descriptor.Field("change_kind", Optional.of(ChangeKindEnumType.CHANGE_KIND)));
 
@@ -223,6 +235,18 @@ public class Changes
             throw new PrestoException(INVALID_FUNCTION_ARGUMENT, name + " must be a bigint");
         }
         return (long) value;
+    }
+
+    private static boolean requireBooleanArgument(Map<String, Argument> arguments, String name)
+    {
+        Object value = requireScalarArgument(arguments, name);
+        if (value == null) {
+            throw new PrestoException(INVALID_FUNCTION_ARGUMENT, name + " is null");
+        }
+        if (!(value instanceof Boolean)) {
+            throw new PrestoException(INVALID_FUNCTION_ARGUMENT, name + " must be a boolean");
+        }
+        return (boolean) value;
     }
 
     private static Object requireScalarArgument(Map<String, Argument> arguments, String name)
