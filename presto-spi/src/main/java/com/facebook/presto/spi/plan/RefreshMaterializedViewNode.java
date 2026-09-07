@@ -47,6 +47,7 @@ public final class RefreshMaterializedViewNode
     private final SchemaTableName materializedViewName;
     private final TableHandle storageTableHandle;
     private final PlanNode source;
+    private final Optional<PlanNode> deleteSource;
     private final List<ColumnHandle> columnHandles;
     private final List<VariableReferenceExpression> outputVariables;
 
@@ -57,6 +58,7 @@ public final class RefreshMaterializedViewNode
             @JsonProperty("materializedViewName") SchemaTableName materializedViewName,
             @JsonProperty("storageTableHandle") TableHandle storageTableHandle,
             @JsonProperty("source") PlanNode source,
+            @JsonProperty("deleteSource") Optional<PlanNode> deleteSource,
             @JsonProperty("columnHandles") List<ColumnHandle> columnHandles,
             @JsonProperty("outputVariables") List<VariableReferenceExpression> outputVariables)
     {
@@ -64,8 +66,20 @@ public final class RefreshMaterializedViewNode
         this.materializedViewName = requireNonNull(materializedViewName, "materializedViewName is null");
         this.storageTableHandle = requireNonNull(storageTableHandle, "storageTableHandle is null");
         this.source = requireNonNull(source, "source is null");
+        this.deleteSource = requireNonNull(deleteSource, "deleteSource is null");
         this.columnHandles = Collections.unmodifiableList(requireNonNull(columnHandles, "columnHandles is null"));
         this.outputVariables = Collections.unmodifiableList(requireNonNull(outputVariables, "outputVariables is null"));
+    }
+
+    public RefreshMaterializedViewNode(Optional<SourceLocation> sourceLocation, PlanNodeId id, SchemaTableName materializedViewName, TableHandle storageTableHandle, PlanNode source, List<ColumnHandle> columnHandles, List<VariableReferenceExpression> outputVariables)
+    {
+        this(sourceLocation, id, materializedViewName, storageTableHandle, source, Optional.empty(), columnHandles, outputVariables);
+    }
+
+    @JsonProperty
+    public Optional<PlanNode> getDeleteSource()
+    {
+        return deleteSource;
     }
 
     @JsonProperty
@@ -102,21 +116,25 @@ public final class RefreshMaterializedViewNode
     @Override
     public List<PlanNode> getSources()
     {
+        if (deleteSource.isPresent()) {
+            return java.util.Arrays.asList(deleteSource.get(), source);
+        }
         return singletonList(source);
     }
 
     @Override
     public PlanNode replaceChildren(List<PlanNode> newChildren)
     {
-        if (newChildren.size() != 1) {
-            throw new IllegalArgumentException("Expected exactly one child, got " + newChildren.size());
+        if (newChildren.size() != (deleteSource.isPresent() ? 2 : 1)) {
+            throw new IllegalArgumentException("Expected " + (deleteSource.isPresent() ? 2 : 1) + " children, got " + newChildren.size());
         }
         return new RefreshMaterializedViewNode(
                 getSourceLocation(),
                 getId(),
                 materializedViewName,
                 storageTableHandle,
-                newChildren.get(0),
+                deleteSource.isPresent() ? Optional.of(newChildren.get(0)) : Optional.empty(),
+                deleteSource.isPresent() ? newChildren.get(1) : newChildren.get(0),
                 columnHandles,
                 outputVariables);
     }
