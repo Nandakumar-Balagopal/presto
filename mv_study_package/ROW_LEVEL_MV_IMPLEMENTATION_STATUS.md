@@ -52,28 +52,50 @@ whole-file-delete change sets.
 
 ## What works
 
-Verified by running it, not by reading it.
+Verified by running it, with plan-shape assertions rather than answer checks
+alone -- a full recompute returns the right answer too, so correctness by itself
+never shows which plan ran.
 
-- **The branch compiles.** It did not before: `presto-spi` failed outright, so
-  nothing downstream had ever been built and none of the earlier work had been
-  exercised.
-- **The coordinator starts.** `ChangeKindEnumType` was registered twice on one
-  unconditional startup path and `addUserDefinedType` rejects a duplicate, so
-  startup always threw.
-- **`system.changes(table, from, to)`** runs end to end on a V3 Iceberg table
-  and returns non-null `$row_id` values. This needed four separate fixes: plan
-  fragment serialization for `ConnectorTableVersion` and `ChangesFunctionSplit`,
-  a real `SessionPropertyManager` instead of a testing one, the row-lineage
-  column looked up under the name the connector exposes, and change-set splits
-  carrying a real `first_row_id` instead of the V1/V2 sentinel.
-- **`affected_identifiers`** backs the fresh branch of both candidates, with a
-  null-safe anti-join.
-- **A row-level candidate** is offered to the cost picker alongside the
-  partition-level one and full recompute, driven by the connector's
-  `changedRowsPredicates`.
+### Reading a stale materialized view: works
 
-`mvn validate` passes for `presto-spi`, `presto-main-base`, `presto-iceberg`,
-`presto-main` and `presto-tests`, which is where `presto-checks.xml` runs.
+Row-level stitching returns correct results over an append-only V3 base, on
+partitioned and unpartitioned storage alike. The fresh branch anti-joins the
+storage table against `affected_identifiers` and the delta recomputes the
+affected groups:
+
+```
+FilterProject[IS_NULL(affected)]
+└── LeftJoin[NOT(region IS DISTINCT FROM region_96)]
+    ├── TableScan[__mv_storage__…]
+    └── Project[affected := true] ← Aggregate(DISTINCT)[region_96]
+        └── ScanFilterProject[base, _last_updated_sequence_number > 1]
+```
+
+### REFRESH MATERIALIZED VIEW: works in one safe configuration
+
+The refresh recomputes only changed groups, gated on two conditions:
+
+- the storage table is partitioned by exactly the view's grouping columns, so
+  replacing the partitions of the files written replaces exactly those groups;
+- the status reports partition refresh data, because without it the connector
+  commits by overwriting the whole storage table.
+
+Outside that configuration row-level declines and the refresh stays
+partition-level. Both directions are covered by `TestIcebergRowLevelStitching`.
+
+### Enablement
+
+Nothing is on by default. Reading a stale view needs
+`materialized_view_stale_read_behavior=USE_STITCHING` (the default re-runs the
+view query), `materialized_view_stitching_strategy` other than `NEVER`, and
+`materialized_view_row_level_incremental_strategy` other than `NEVER`. Refresh
+additionally needs the view to have `refresh_type = 'INCREMENTAL'`, since the
+default refresh type is `FULL` and is recorded when the view is created.
+
+Row-level defaults to `NEVER` because `affected_identifiers` is still built only
+from `from_current_base`. A group whose rows were all deleted has nothing left to
+identify it, so its stale rows would survive. Appends cannot hit this; a
+whole-partition `DELETE` can.
 
 ## Correctness defects fixed along the way
 
@@ -120,27 +142,33 @@ from a filter to an anti-join without any test noticing. It is covered now.
 
 ### Reachable today
 
-- Per-MV `row_level_incremental_refresh` property (`true`/`false`/`auto`). Only
-  the `materialized_view_row_level_incremental_strategy` session property
-  exists, so the spec's MV-versus-session precedence rule is unimplemented.
+- `from_changeset_deletes`, the second input to `affected_identifiers`. Until it
+  lands, row-level is correct only for change sets without deletions, which is
+  why it defaults to `NEVER`. Iceberg's `CHANGELOG` table type may be scannable
+  as an ordinary `TableScanNode`, which would be far cheaper than constructing a
+  table-function node inside the optimizer.
+- `estimateChangeSetSize` is still not read by the stats calculator, so the cost
+  picker prices the row-level leaf from generic table-scan statistics and will
+  rarely prefer it on `AUTOMATIC`.
+- A refresh that commits by replacing arbitrary rows rather than whole
+  partitions. That needs the delete-fragment path: `RefreshMaterializedViewCommit`
+  carries delete fragments end to end, but its only producer passes an empty
+  list, and the Iceberg commit uses `ReplacePartitions`. With it, the
+  storage-partitioning precondition above disappears.
+- Per-MV `row_level_incremental_refresh` property and its precedence against the
+  session property.
 - `MATERIALIZED_VIEW_ROW_LEVEL_REJECTED_ON_COST` warning.
-- Feed `estimateChangeSetSize` into the stats calculator so the row-level leaf
-  is costed from change-set cardinality rather than a default.
-- Case A is dead code: `projectClosure` returns empty for any non-empty closure,
-  so the first `ProjectNode` destroys the closure and every aggregation takes
-  Case B. Fixing it needs pass-through column bindings on `PlanVariants`.
-- `visitExcept` still uses partition replacement; the delta-minus rule needs
-  delta-plus/delta-minus tracking.
-- Classical IVM for SUM/COUNT.
+- A stale partition-level warning still claims a fall back to full recompute in
+  cases where row-level then succeeded.
+- `visitExcept` still uses partition replacement rather than the delta-minus
+  rule, which needs delta-plus/delta-minus tracking.
+- Classical IVM for SUM and COUNT.
 
 ### Blocked on V3 row-level write support
 
-- Row-preserving MVs, which need the `$rowId_origin` storage column.
-- The atomic delete-plus-insert refresh commit. The main branch has
-  refresh-handle, fragment-payload and planner-finish scaffolding but generates
-  no real delete fragments and performs no Iceberg commit.
+- Row-preserving materialized views, which need the `$rowId_origin` column.
 - Deletion vectors in change sets.
-- The Tier 4 correctness suite's update and row-level-delete cases.
+- The Tier 4 update and row-level-delete cases.
 
 ## Scope note on the query path
 
