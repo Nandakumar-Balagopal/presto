@@ -76,7 +76,9 @@ FilterProject[IS_NULL(affected)]
 The refresh recomputes only changed groups, gated on two conditions:
 
 - the storage table is partitioned by exactly the view's grouping columns, so
-  replacing the partitions of the files written replaces exactly those groups;
+  replacing the partitions of the files written replaces exactly those groups. This is a constraint
+  imposed by the commit primitive, not by row-level refresh: the handover assumes an atomic
+  delete-plus-insert commit, under which it disappears entirely;
 - the status reports partition refresh data, because without it the connector
   commits by overwriting the whole storage table.
 
@@ -159,10 +161,16 @@ REFRESH MATERIALIZED VIEW v;
 SELECT * FROM v;   -- returns NA with its old total; should return only EU
 ```
 
-This is not specific to row-level refresh, and predates it: the same case fails with
-`materialized_view_row_level_incremental_strategy = NEVER`, on the partition-level delta. Declining
-the delta does not help either, because a full recompute still commits through `ReplacePartitions`
-whenever partition staleness is available, and so still only replaces the partitions it wrote.
+This is not specific to row-level refresh and does not originate on this branch. The commit choice
+between `OverwriteFiles` and `ReplacePartitions` comes from upstream master, in
+`995dbad434e` "feat(optimizer): Support incremental refresh of materialized views (#26959)". The
+`fullRefreshRequired` condition was later rewritten on this branch as `!hasPartitionRefreshData()`,
+but that expands to exactly the upstream expression, so it changed nothing.
+
+The same case fails with `materialized_view_row_level_incremental_strategy = NEVER`, on the
+partition-level delta. Declining the delta does not help either, because a full recompute still
+commits through `ReplacePartitions` whenever partition staleness is available, and so still only
+replaces the partitions it wrote.
 
 Fixing it needs the commit to be able to express a deletion: either the delete-fragment path, or
 forcing `OverwriteFiles.overwriteByRowFilter(alwaysTrue())` for views that can drop a group, which
@@ -182,7 +190,9 @@ above its aggregation -- should not be refreshed incrementally.
   picker prices the row-level leaf from generic table-scan statistics and will
   rarely prefer it on `AUTOMATIC`.
 - A refresh that commits by replacing arbitrary rows rather than whole
-  partitions. That needs the delete-fragment path: `RefreshMaterializedViewCommit`
+  partitions. This is the highest-leverage remaining item, because it removes the storage-partitioning
+  constraint above *and* fixes the upstream defect recorded earlier, both of which are the same
+  inability to delete. It needs the delete-fragment path: `RefreshMaterializedViewCommit`
   carries delete fragments end to end, but its only producer passes an empty
   list, and the Iceberg commit uses `ReplacePartitions`. With it, the
   storage-partitioning precondition above disappears.
