@@ -46,7 +46,6 @@ import com.facebook.presto.metadata.Catalog;
 import com.facebook.presto.metadata.CatalogManager;
 import com.facebook.presto.metadata.DiscoveryNodeManager;
 import com.facebook.presto.metadata.FunctionAndTypeManager;
-import com.facebook.presto.type.ChangeKindEnumType;
 import com.facebook.presto.metadata.InternalNodeManager;
 import com.facebook.presto.metadata.SessionPropertyManager;
 import com.facebook.presto.metadata.StaticCatalogStore;
@@ -255,7 +254,6 @@ public class PrestoServer
             injector.getInstance(ExpressionOptimizerManager.class).loadExpressionOptimizerFactories(authClientConfigs);
 
             FunctionAndTypeManager functionAndTypeManager = injector.getInstance(FunctionAndTypeManager.class);
-            functionAndTypeManager.addUserDefinedType(ChangeKindEnumType.USER_DEFINED_TYPE);
             functionAndTypeManager.getBuiltInPluginFunctionNamespaceManager().triggerConflictCheckWithBuiltInFunctions();
 
             startAssociatedProcesses(injector);
