@@ -14,7 +14,6 @@
 package com.facebook.presto.connector.system;
 
 import com.facebook.presto.Session;
-import com.facebook.presto.SystemSessionProperties;
 import com.facebook.presto.common.Page;
 import com.facebook.presto.common.QualifiedObjectName;
 import com.facebook.presto.common.Subfield;
@@ -25,6 +24,7 @@ import com.facebook.presto.common.type.BooleanType;
 import com.facebook.presto.common.type.TimeZoneKey;
 import com.facebook.presto.metadata.InternalNodeManager;
 import com.facebook.presto.metadata.Metadata;
+import com.facebook.presto.metadata.SessionPropertyManager;
 import com.facebook.presto.spi.ChangeKindPageSource;
 import com.facebook.presto.spi.ColumnHandle;
 import com.facebook.presto.spi.ColumnMetadata;
@@ -71,7 +71,6 @@ import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 
 import static com.facebook.presto.common.type.VarcharType.VARCHAR;
-import static com.facebook.presto.metadata.SessionPropertyManager.createTestingSessionPropertyManager;
 import static com.facebook.presto.spi.StandardErrorCode.GENERIC_INTERNAL_ERROR;
 import static com.facebook.presto.spi.StandardErrorCode.INVALID_FUNCTION_ARGUMENT;
 import static com.facebook.presto.spi.StandardErrorCode.NOT_SUPPORTED;
@@ -100,13 +99,22 @@ public class Changes
     private static final String FROM_ARGUMENT = "FROM_VERSION";
     private static final String TO_ARGUMENT = "TO_VERSION";
     private static final String INCLUDE_ROW_ID_ARGUMENT = "INCLUDE_ROW_ID";
+    /**
+     * The hidden column a connector exposes for durable row identity. There is no SPI method to
+     * discover it yet, so the name has to be assumed; it matches Iceberg's
+     * {@code MetadataColumns.ROW_ID}, the only connector that currently supplies a change set.
+     */
+    private static final String ROW_LINEAGE_COLUMN_NAME = "_row_id";
+    /** The name this function gives the row identity in its own output schema. */
+    private static final String ROW_ID_OUTPUT_COLUMN_NAME = "$row_id";
 
     private final Metadata metadata;
     private final InternalNodeManager nodeManager;
     private final AccessControl accessControl;
+    private final SessionPropertyManager sessionPropertyManager;
 
     @Inject
-    public Changes(Metadata metadata, InternalNodeManager nodeManager, AccessControl accessControl)
+    public Changes(Metadata metadata, InternalNodeManager nodeManager, AccessControl accessControl, SessionPropertyManager sessionPropertyManager)
     {
         super(
                 "builtin",
@@ -120,6 +128,7 @@ public class Changes
         this.metadata = requireNonNull(metadata, "metadata is null");
         this.nodeManager = requireNonNull(nodeManager, "nodeManager is null");
         this.accessControl = requireNonNull(accessControl, "accessControl is null");
+        this.sessionPropertyManager = requireNonNull(sessionPropertyManager, "sessionPropertyManager is null");
     }
 
     @Override
@@ -168,7 +177,7 @@ public class Changes
             outputColumns.add(new Descriptor.Field(column.getName(), Optional.of(column.getType())));
         }
         if (includeRowId) {
-            ColumnHandle rowIdHandle = columnHandles.get("$row_id");
+            ColumnHandle rowIdHandle = columnHandles.get(ROW_LINEAGE_COLUMN_NAME);
             if (rowIdHandle == null) {
                 throw new PrestoException(NOT_SUPPORTED, "TABLE does not expose a row lineage column");
             }
@@ -177,9 +186,9 @@ public class Changes
                     engineSession.getIdentity(),
                     engineSession.getAccessControlContext(),
                     QualifiedObjectName.valueOf(tableName),
-                    ImmutableSet.of(new Subfield("$row_id", ImmutableList.of())));
+                    ImmutableSet.of(new Subfield(ROW_LINEAGE_COLUMN_NAME, ImmutableList.of())));
             projectedColumns.add(rowIdHandle);
-            outputColumns.add(new Descriptor.Field("$row_id", Optional.of(metadata.getColumnMetadata(engineSession, tableHandle, rowIdHandle).getType())));
+            outputColumns.add(new Descriptor.Field(ROW_ID_OUTPUT_COLUMN_NAME, Optional.of(metadata.getColumnMetadata(engineSession, tableHandle, rowIdHandle).getType())));
         }
         outputColumns.add(new Descriptor.Field("change_kind", Optional.of(ChangeKindEnumType.CHANGE_KIND)));
 
@@ -214,7 +223,7 @@ public class Changes
             @Override
             public TableFunctionSplitProcessor getSplitProcessor(ConnectorTableFunctionHandle handle)
             {
-                return new ChangesSplitProcessor(metadata, (ChangesFunctionHandle) handle);
+                return new ChangesSplitProcessor(metadata, sessionPropertyManager, (ChangesFunctionHandle) handle);
             }
         };
     }
@@ -330,6 +339,12 @@ public class Changes
             this.coordinator = requireNonNull(coordinator, "coordinator is null");
         }
 
+        @JsonProperty
+        public HostAddress getCoordinator()
+        {
+            return coordinator;
+        }
+
         @Override
         public NodeSelectionStrategy getNodeSelectionStrategy()
         {
@@ -416,13 +431,15 @@ public class Changes
             implements TableFunctionSplitProcessor
     {
         private final Metadata metadata;
+        private final SessionPropertyManager sessionPropertyManager;
         private final ChangesFunctionHandle handle;
         private ChangeKindPageSource pageSource;
         private boolean splitUsed;
 
-        private ChangesSplitProcessor(Metadata metadata, ChangesFunctionHandle handle)
+        private ChangesSplitProcessor(Metadata metadata, SessionPropertyManager sessionPropertyManager, ChangesFunctionHandle handle)
         {
             this.metadata = requireNonNull(metadata, "metadata is null");
+            this.sessionPropertyManager = requireNonNull(sessionPropertyManager, "sessionPropertyManager is null");
             this.handle = requireNonNull(handle, "handle is null");
         }
 
@@ -434,7 +451,7 @@ public class Changes
                     return FINISHED;
                 }
                 pageSource = metadata.getChangeSet(
-                        toSession(handle.getSession()),
+                        toSession(sessionPropertyManager, handle.getSession()),
                         handle.getTableHandle(),
                         handle.getFrom(),
                         handle.getTo(),
@@ -469,9 +486,15 @@ public class Changes
         }
     }
 
-    private static Session toSession(ChangesSession changesSession)
+    /**
+     * Rebuilds the originating session for the change-set scan. The real SessionPropertyManager is
+     * required: a testing one has no connectors registered, so the first catalog property the
+     * connector reads fails with "Unknown connector". Catalog properties cannot be replayed onto a
+     * session that already carries a transaction id, so the connector sees their declared defaults.
+     */
+    private static Session toSession(SessionPropertyManager sessionPropertyManager, ChangesSession changesSession)
     {
-        return Session.builder(createTestingSessionPropertyManager(new SystemSessionProperties()))
+        return Session.builder(sessionPropertyManager)
                 .setQueryId(new QueryId(changesSession.getQueryId()))
                 .setTransactionId(changesSession.getTransactionId())
                 .setCatalog("system")
