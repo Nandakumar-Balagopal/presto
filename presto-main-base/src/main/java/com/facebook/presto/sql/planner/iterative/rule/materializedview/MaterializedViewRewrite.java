@@ -31,6 +31,7 @@ import com.facebook.presto.spi.PrestoWarning;
 import com.facebook.presto.spi.SchemaTableName;
 import com.facebook.presto.spi.TableHandle;
 import com.facebook.presto.spi.VariableAllocator;
+import com.facebook.presto.spi.WarningCollector;
 import com.facebook.presto.spi.analyzer.MetadataResolver;
 import com.facebook.presto.spi.plan.Assignments;
 import com.facebook.presto.spi.plan.MVRewriteCandidatesNode;
@@ -52,6 +53,7 @@ import java.util.Optional;
 
 import static com.facebook.presto.SystemSessionProperties.getMaterializedViewStaleReadBehavior;
 import static com.facebook.presto.SystemSessionProperties.getMaterializedViewStalenessWindow;
+import static com.facebook.presto.SystemSessionProperties.getMaterializedViewRowLevelIncrementalStrategy;
 import static com.facebook.presto.SystemSessionProperties.getMaterializedViewStitchingStrategy;
 import static com.facebook.presto.SystemSessionProperties.isLegacyMaterializedViews;
 import static com.facebook.presto.SystemSessionProperties.isMaterializedViewForceStale;
@@ -154,11 +156,21 @@ public class MaterializedViewRewrite
                         context.getLookup(),
                         context.getWarningCollector());
 
-                if (unionPlan.isPresent()) {
+                Optional<PlanNode> rowLevelPlan = buildRowLevelPlan(
+                        session, node, status, constraints, definition, variableAllocator, idAllocator, context, unionPlan.isPresent());
+
+                ImmutableList.Builder<PlanNode> stitchedPlans = ImmutableList.builder();
+                // Row-level first: with a non-cost-based strategy the most selective eligible plan
+                // wins, and with AUTOMATIC the order only affects tie-breaking.
+                rowLevelPlan.ifPresent(stitchedPlans::add);
+                unionPlan.ifPresent(stitchedPlans::add);
+                List<PlanNode> candidates = stitchedPlans.build();
+
+                if (!candidates.isEmpty()) {
                     if (stitchingStrategy == MaterializedViewRewriteStrategy.AUTOMATIC) {
-                        return Result.ofPlanNode(buildAutomaticCandidates(node, unionPlan.get(), idAllocator));
+                        return Result.ofPlanNode(buildAutomaticCandidates(node, candidates, idAllocator));
                     }
-                    return Result.ofPlanNode(unionPlan.get());
+                    return Result.ofPlanNode(candidates.get(0));
                 }
             }
         }
@@ -183,7 +195,56 @@ public class MaterializedViewRewrite
         return Result.ofPlanNode(projectToOutputs(node, plan, mappings, idAllocator));
     }
 
-    private PlanNode buildAutomaticCandidates(MaterializedViewScanNode node, PlanNode stitchedPlan, PlanNodeIdAllocator idAllocator)
+    /**
+     * Builds the row-level candidate, which differs from the partition-level one only in that each
+     * base the connector reports changed rows for gets a row-level leaf. Bases without one keep
+     * their partition-level leaf, so a single candidate spans V3 and V2 bases.
+     *
+     * <p>Warnings are collected separately: a row-level decline is not a fall back to full
+     * recompute when the partition-level candidate stands, so buildStitchedPlan's own framing would
+     * mislead.
+     */
+    private Optional<PlanNode> buildRowLevelPlan(
+            Session session,
+            MaterializedViewScanNode node,
+            MaterializedViewStatus status,
+            Map<SchemaTableName, MaterializedDataPredicates> constraints,
+            MaterializedViewDefinition definition,
+            VariableAllocator variableAllocator,
+            PlanNodeIdAllocator idAllocator,
+            Context context,
+            boolean partitionLevelAvailable)
+    {
+        if (!status.hasRowLevelChanges()) {
+            return Optional.empty();
+        }
+        if (getMaterializedViewRowLevelIncrementalStrategy(session) == MaterializedViewRewriteStrategy.NEVER) {
+            return Optional.empty();
+        }
+
+        WarningCollector rowLevelWarnings = partitionLevelAvailable ? WarningCollector.NOOP : context.getWarningCollector();
+        Optional<PlanNode> plan = buildStitchedPlan(
+                metadata,
+                session,
+                node,
+                constraints,
+                status.getChangedRowsPredicates(),
+                definition,
+                variableAllocator,
+                idAllocator,
+                context.getLookup(),
+                rowLevelWarnings);
+
+        if (!plan.isPresent() && partitionLevelAvailable) {
+            context.getWarningCollector().add(new PrestoWarning(
+                    MATERIALIZED_VIEW_STITCHING_FALLBACK,
+                    "Cannot use row-level stitching for materialized view " + node.getMaterializedViewName() +
+                            "; falling back to partition-level stitching."));
+        }
+        return plan;
+    }
+
+    private PlanNode buildAutomaticCandidates(MaterializedViewScanNode node, List<PlanNode> stitchedPlans, PlanNodeIdAllocator idAllocator)
     {
         PlanNode projectedViewQuery = projectToOutputs(node, node.getViewQueryPlan(), node.getViewQueryMappings(), idAllocator);
         QualifiedObjectName mvName = node.getMaterializedViewName();
@@ -191,11 +252,13 @@ public class MaterializedViewRewrite
                 node.getSourceLocation(),
                 idAllocator.getNextId(),
                 projectedViewQuery,
-                ImmutableList.of(new MVRewriteCandidate(
-                        stitchedPlan,
-                        mvName.getCatalogName(),
-                        mvName.getSchemaName(),
-                        mvName.getObjectName())),
+                stitchedPlans.stream()
+                        .map(plan -> new MVRewriteCandidate(
+                                plan,
+                                mvName.getCatalogName(),
+                                mvName.getSchemaName(),
+                                mvName.getObjectName()))
+                        .collect(toImmutableList()),
                 node.getOutputVariables());
     }
 

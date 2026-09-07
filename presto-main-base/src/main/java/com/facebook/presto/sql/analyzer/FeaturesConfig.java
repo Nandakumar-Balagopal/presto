@@ -260,6 +260,8 @@ public class FeaturesConfig
     private MaterializedViewRefreshType materializedViewDefaultRefreshType = MaterializedViewRefreshType.FULL;
     private MaterializedViewStaleReadBehavior materializedViewStaleReadBehavior = MaterializedViewStaleReadBehavior.USE_VIEW_QUERY;
     private MaterializedViewRewriteStrategy materializedViewStitchingStrategy = MaterializedViewRewriteStrategy.ALWAYS;
+    // Row-level refresh defaults to AUTOMATIC so it only fires where the cost picker finds it cheaper.
+    private MaterializedViewRewriteStrategy materializedViewRowLevelIncrementalStrategy = MaterializedViewRewriteStrategy.AUTOMATIC;
     private MaterializedViewRewriteStrategy materializedViewIncrementalRefreshStrategy = MaterializedViewRewriteStrategy.ALWAYS;
 
     private AggregationIfToFilterRewriteStrategy aggregationIfToFilterRewriteStrategy = AggregationIfToFilterRewriteStrategy.DISABLED;
@@ -2632,6 +2634,19 @@ public class FeaturesConfig
     public FeaturesConfig setMaterializedViewStitchingStrategy(MaterializedViewRewriteStrategy value)
     {
         this.materializedViewStitchingStrategy = value;
+        return this;
+    }
+
+    public MaterializedViewRewriteStrategy getMaterializedViewRowLevelIncrementalStrategy()
+    {
+        return materializedViewRowLevelIncrementalStrategy;
+    }
+
+    @Config("materialized-view-row-level-incremental-strategy")
+    @ConfigDescription("Controls when row-level incremental refresh of materialized views fires (ALWAYS, NEVER, or AUTOMATIC for cost-based)")
+    public FeaturesConfig setMaterializedViewRowLevelIncrementalStrategy(MaterializedViewRewriteStrategy value)
+    {
+        this.materializedViewRowLevelIncrementalStrategy = value;
         return this;
     }
 
