@@ -544,15 +544,16 @@ public class DifferentialPlanRewriter
                         "row-level refresh of a row-preserving materialized view requires row-origin storage, which is not implemented yet"));
 
         Map<VariableReferenceExpression, TableColumn> baseColumnByVariable =
-                resolveBaseColumnsByVariable(metadata, session, viewQueryPlan, baseTable, lookup);
+                resolveBaseColumnsByVariable(metadata, session, viewQueryPlan, lookup);
 
         ImmutableMap.Builder<String, VariableReferenceExpression> identifiers = ImmutableMap.builder();
         for (VariableReferenceExpression groupingKey : aggregation.getGroupingKeys()) {
-            TableColumn baseColumn = baseColumnByVariable.get(groupingKey);
-            if (baseColumn == null) {
+            TableColumn resolvedColumn = baseColumnByVariable.get(groupingKey);
+            if (resolvedColumn == null || !resolvedColumn.getTableName().equals(baseTable)) {
                 throw new UnsupportedOperationException(format(
                         "grouping key %s is not a column of %s, so affected groups cannot be identified", groupingKey.getName(), baseTable));
             }
+            TableColumn baseColumn = resolvedColumn;
             String storageColumn = columnEquivalences.getStorageColumnName(dataTable, baseTable, baseColumn.getColumnName())
                     .orElseThrow(() -> new UnsupportedOperationException(format(
                             "grouping column %s has no equivalent column on the storage table", baseColumn)));
@@ -790,15 +791,11 @@ public class DifferentialPlanRewriter
             Metadata metadata,
             Session session,
             PlanNode plan,
-            SchemaTableName baseTable,
             Lookup lookup)
     {
         Map<VariableReferenceExpression, TableColumn> resolved = new HashMap<>();
-        buildColumnToVariableMapping(metadata, session, plan, lookup).forEach((column, variable) -> {
-            if (column.getTableName().equals(baseTable)) {
-                resolved.putIfAbsent(variable, column);
-            }
-        });
+        buildColumnToVariableMapping(metadata, session, plan, lookup)
+                .forEach((column, variable) -> resolved.putIfAbsent(variable, column));
 
         // A rename may sit above another rename, so propagate until nothing new resolves.
         List<PlanNode> renamingNodes = ImmutableList.<PlanNode>builder()
@@ -1279,13 +1276,25 @@ public class DifferentialPlanRewriter
                 return true;
             }
 
-            Map<TableColumn, VariableReferenceExpression> sourceColumns =
-                    buildColumnToVariableMapping(metadata, session, node.getSource(), lookup);
-            Set<TableColumn> groupingColumns = sourceColumns.entrySet().stream()
-                    .filter(entry -> node.getGroupingKeys().contains(entry.getValue()))
-                    .map(Map.Entry::getKey)
-                    .collect(toImmutableSet());
-            return !groupingColumns.containsAll(closure.get());
+            // Resolve through renames: by this point the planner has usually renamed the grouping
+            // keys, most often via GroupIdNode, and reading the scan's own assignments alone would
+            // find none of them and always choose the expansion.
+            Map<VariableReferenceExpression, TableColumn> baseColumns =
+                    resolveBaseColumnsByVariable(metadata, session, node.getSource(), lookup);
+
+            ImmutableSet.Builder<TableColumn> groupingColumns = ImmutableSet.builder();
+            for (VariableReferenceExpression groupingKey : node.getGroupingKeys()) {
+                TableColumn column = baseColumns.get(groupingKey);
+                if (column == null) {
+                    // A grouping key computed from a base column, rather than renamed from one,
+                    // tells us nothing about how groups line up with the stale boundary. Expand.
+                    return true;
+                }
+                groupingColumns.add(column);
+            }
+            // Case A applies when the stale boundary is expressed only over grouping columns, so
+            // every group is wholly inside or wholly outside the delta.
+            return !groupingColumns.build().containsAll(closure.get());
         }
 
         private NodeWithMapping buildExpandedDelta(AggregationNode aggregation, PlanVariants child)
@@ -1573,12 +1582,13 @@ public class DifferentialPlanRewriter
 
         private Optional<Set<TableColumn>> projectClosure(Optional<Set<TableColumn>> closure)
         {
-            // A projection can remove or transform a stale-boundary column. Until the
-            // pass-through mapping is carried with PlanVariants, treat non-empty closures
-            // as unknown so aggregation dispatch selects the conservative expansion path.
-            if (!closure.isPresent() || !closure.get().isEmpty()) {
-                return Optional.empty();
-            }
+            // The closure names base table columns, and a projection does not change which base
+            // columns the leaf predicate is expressed over -- only what the rows are called by the
+            // time they arrive. Whether a projection preserved the correspondence is decided where
+            // it matters, in requiresExpandedDelta, which resolves each grouping key back to a base
+            // column and expands whenever one cannot be resolved. Discarding the closure here
+            // instead made Case A unreachable for any plan with a projection, which is nearly all
+            // of them, so every aggregation paid for the expansion.
             return closure;
         }
 

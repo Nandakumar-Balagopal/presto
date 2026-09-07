@@ -30,6 +30,7 @@ import com.facebook.presto.spi.TableHandle;
 import com.facebook.presto.spi.VariableAllocator;
 import com.facebook.presto.spi.WarningCollector;
 import com.facebook.presto.spi.plan.AggregationNode;
+import com.facebook.presto.spi.plan.Assignments;
 import com.facebook.presto.spi.plan.EquiJoinClause;
 import com.facebook.presto.spi.plan.ExceptNode;
 import com.facebook.presto.spi.plan.FilterNode;
@@ -699,6 +700,62 @@ public class TestDifferentialPlanRewriter
                 "Case B projects the current rows after matching affected groups, got: " + deltaAggregation.getSource().getClass().getSimpleName());
         assertTrue(((ProjectNode) deltaAggregation.getSource()).getSource() instanceof JoinNode,
                 "Case B matches current rows against the affected groups");
+    }
+
+    @Test
+    public void testAggregationTakesCaseAWhenStaleBoundaryIsAGroupingColumn()
+    {
+        // The stale boundary is orderdate and the view groups by it, so every group is wholly
+        // inside or wholly outside the delta and the aggregation can be applied to the delta
+        // directly. A projection renames orderdate on the way up, which is what previously
+        // discarded the closure and forced the expansion for every plan with a projection.
+        TableScanNode orders = createOrdersTableScan();
+        VariableReferenceExpression orderdate = orders.getOutputVariables().get(1);
+        VariableReferenceExpression renamed = variableAllocator.newVariable("ds", VARCHAR);
+
+        ProjectNode rename = new ProjectNode(
+                idAllocator.getNextId(),
+                orders,
+                Assignments.builder().put(renamed, orderdate).build());
+
+        AggregationNode aggregation = new AggregationNode(
+                Optional.empty(),
+                idAllocator.getNextId(),
+                rename,
+                ImmutableMap.of(),
+                new AggregationNode.GroupingSetDescriptor(ImmutableList.of(renamed), 1, ImmutableSet.of()),
+                ImmutableList.of(),
+                AggregationNode.Step.SINGLE,
+                Optional.empty(),
+                Optional.empty(),
+                Optional.empty());
+
+        Map<SchemaTableName, List<TupleDomain<String>>> staleConstraints = ImmutableMap.of(
+                ORDERS_TABLE, ImmutableList.of(
+                        TupleDomain.withColumnDomains(ImmutableMap.of(
+                                "orderdate", Domain.singleValue(VARCHAR, utf8Slice("2024-01-01"))))));
+
+        DifferentialPlanRewriter builder = new DifferentialPlanRewriter(
+                metadata,
+                session,
+                idAllocator,
+                variableAllocator,
+                staleConstraints,
+                createSimplePassthroughColumnEquivalences(ORDERS_TABLE, "orderdate"),
+                lookup,
+                WarningCollector.NOOP);
+
+        DifferentialPlanRewriter.NodeWithMapping result =
+                builder.buildDeltaPlan(aggregation, createIdentityMapping(aggregation.getOutputVariables()));
+
+        assertTrue(result.getNode() instanceof AggregationNode);
+        PlanNode source = ((AggregationNode) result.getNode()).getSource();
+        assertTrue(source instanceof ProjectNode, "expected the view's own projection, got: " + source.getClass().getSimpleName());
+        // Case B would put a join here to match the current base against the affected groups.
+        assertFalse(((ProjectNode) source).getSource() instanceof JoinNode,
+                "Case A should aggregate the delta directly, not expand affected groups");
+        assertTrue(((ProjectNode) source).getSource() instanceof FilterNode,
+                "the delta is the stale-filtered base scan, got: " + ((ProjectNode) source).getSource().getClass().getSimpleName());
     }
 
     // Helper methods
