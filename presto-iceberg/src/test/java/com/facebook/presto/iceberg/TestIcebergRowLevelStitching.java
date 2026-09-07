@@ -196,11 +196,125 @@ public class TestIcebergRowLevelStitching
         }
     }
 
+    /**
+     * Incremental refresh has to be asked for: the default refresh type is FULL, which returns the
+     * unmodified view query before any delta is considered.
+     */
+    private Session refreshSession()
+    {
+        return Session.builder(getSession())
+                .setSystemProperty("materialized_view_default_refresh_type", "INCREMENTAL")
+                .setSystemProperty("materialized_view_incremental_refresh_strategy", "ALWAYS")
+                .setSystemProperty("materialized_view_row_level_incremental_strategy", "ALWAYS")
+                .build();
+    }
+
     private String explainView(Session session, String view)
     {
         MaterializedResult result = computeActual(session,
                 "EXPLAIN (TYPE LOGICAL) SELECT region, total FROM " + view + " ORDER BY region");
         assertEquals(result.getMaterializedRows().size(), 1);
         return (String) result.getMaterializedRows().get(0).getField(0);
+    }
+
+    /**
+     * REFRESH MATERIALIZED VIEW recomputing only the changed groups. Safe to commit here because the
+     * storage table is partitioned by the grouping column, so replacing the partitions of the files
+     * written replaces exactly the affected groups.
+     */
+    @Test
+    public void testRowLevelRefreshOverAppendOnlyBase()
+    {
+        String base = "rlr_base";
+        String view = "rlr_mv";
+        try {
+            assertQuerySucceeds("CREATE TABLE " + base + " (region varchar, amount bigint) "
+                    + "WITH (\"format-version\" = '3', partitioning = ARRAY['region'])");
+            assertQuerySucceeds("INSERT INTO " + base + " VALUES ('NA', 10), ('EU', 20), ('NA', 30)");
+            assertQuerySucceeds("CREATE MATERIALIZED VIEW " + view
+                    + " WITH (partitioning = ARRAY['region'], refresh_type = 'INCREMENTAL')"
+                    + " AS SELECT region, SUM(amount) AS total FROM " + base + " GROUP BY region");
+            assertQuerySucceeds("REFRESH MATERIALIZED VIEW " + view);
+            assertQuery("SELECT region, total FROM " + view + " ORDER BY region", "VALUES ('EU', 20), ('NA', 40)");
+
+            // Append only: adds to an existing group and creates a new one.
+            assertQuerySucceeds("INSERT INTO " + base + " VALUES ('NA', 5), ('APAC', 7)");
+
+            Session refresh = refreshSession();
+            // Correctness alone would not show row-level was used, since a partition-level refresh
+            // returns the same answer. The plan must carry the row-lineage predicate.
+            MaterializedResult explained = computeActual(refresh,
+                    "EXPLAIN (TYPE LOGICAL) REFRESH MATERIALIZED VIEW " + view);
+            explained.getWarnings().forEach(w -> System.out.println("EXPLAIN WARNING: " + w.getMessage()));
+            if (explained.getWarnings().isEmpty()) {
+                System.out.println("EXPLAIN WARNING: (none)");
+            }
+            String refreshPlan = (String) explained.getMaterializedRows().get(0).getField(0);
+            System.out.println("REFRESH plan:\n" + refreshPlan);
+            assertTrue(refreshPlan.contains("_last_updated_sequence_number"),
+                    "refresh must recompute from the row-level changed-rows predicate, got:\n" + refreshPlan);
+
+            MaterializedResult result = computeActual(refresh, "REFRESH MATERIALIZED VIEW " + view);
+            result.getWarnings().forEach(w -> System.out.println("REFRESH WARNING: " + w.getMessage()));
+
+            // The refreshed view must equal a direct aggregate over the base: unaffected groups
+            // preserved, affected groups recomputed, nothing duplicated or dropped.
+            assertQuery(
+                    "SELECT region, total FROM " + view + " ORDER BY region",
+                    "VALUES ('APAC', 7), ('EU', 20), ('NA', 45)");
+            // Compared as two Presto queries: the expected side of assertQuery runs against H2,
+            // which does not have the Iceberg tables.
+            assertEquals(
+                    computeActual("SELECT region, total FROM " + view + " ORDER BY region").getMaterializedRows(),
+                    computeActual("SELECT region, SUM(amount) FROM " + base + " GROUP BY region ORDER BY region").getMaterializedRows(),
+                    "refreshed view must equal a direct aggregate over the base");
+        }
+        finally {
+            assertQuerySucceeds("DROP MATERIALIZED VIEW IF EXISTS " + view);
+            assertQuerySucceeds("DROP TABLE IF EXISTS " + base);
+        }
+    }
+
+    /**
+     * The safety gate. The base is partitioned, so the connector commits by replacing the partitions
+     * of the files written -- but the storage table is not partitioned by the grouping column, so
+     * replacing those partitions would discard the groups the delta did not recompute. Row-level
+     * must decline here and leave the refresh partition-level.
+     */
+    @Test
+    public void testRowLevelRefreshDeclinesWhenStorageCannotReplaceGroups()
+    {
+        String base = "rlrd_base";
+        String view = "rlrd_mv";
+        try {
+            assertQuerySucceeds("CREATE TABLE " + base + " (region varchar, amount bigint) "
+                    + "WITH (\"format-version\" = '3', partitioning = ARRAY['region'])");
+            assertQuerySucceeds("INSERT INTO " + base + " VALUES ('NA', 10), ('EU', 20)");
+            // Deliberately unpartitioned storage.
+            assertQuerySucceeds("CREATE MATERIALIZED VIEW " + view
+                    + " WITH (refresh_type = 'INCREMENTAL')"
+                    + " AS SELECT region, SUM(amount) AS total FROM " + base + " GROUP BY region");
+            assertQuerySucceeds("REFRESH MATERIALIZED VIEW " + view);
+            assertQuerySucceeds("INSERT INTO " + base + " VALUES ('NA', 5), ('APAC', 7)");
+
+            Session refresh = refreshSession();
+            MaterializedResult explained = computeActual(refresh,
+                    "EXPLAIN (TYPE LOGICAL) REFRESH MATERIALIZED VIEW " + view);
+            String refreshPlan = (String) explained.getMaterializedRows().get(0).getField(0);
+            assertFalse(refreshPlan.contains("_last_updated_sequence_number"),
+                    "row-level refresh must decline when the storage table cannot have groups replaced, got:\n" + refreshPlan);
+            assertTrue(explained.getWarnings().stream()
+                            .anyMatch(w -> w.getMessage().contains("not partitioned by the view's grouping columns")),
+                    "expected the row-level decline to be reported, got: " + explained.getWarnings());
+
+            // And the refresh must still be correct.
+            computeActual(refresh, "REFRESH MATERIALIZED VIEW " + view);
+            assertQuery("SELECT region, total FROM " + view + " ORDER BY region",
+                    "VALUES ('APAC', 7), ('EU', 20), ('NA', 15)");
+        }
+        finally {
+            assertQuerySucceeds("DROP MATERIALIZED VIEW IF EXISTS " + view);
+            assertQuerySucceeds("DROP TABLE IF EXISTS " + base);
+        }
     }
 }

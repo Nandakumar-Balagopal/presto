@@ -835,6 +835,62 @@ public class DifferentialPlanRewriter
         return renames.buildKeepingLast();
     }
 
+    /**
+     * Whether a refresh may recompute only the changed groups rather than whole stale partitions.
+     *
+     * <p>A refresh commits by replacing the partitions of the files it wrote. Writing only the
+     * affected groups is therefore safe exactly when every storage partition it touches contains
+     * nothing but affected groups, which holds when the storage table is partitioned by precisely
+     * the view's grouping columns: then a partition is a group. Coarser partitioning -- grouping by
+     * day inside monthly partitions, say -- would rewrite a partition from a subset of its groups
+     * and discard the rest, so this returns false and the refresh stays partition-level.
+     *
+     * <p>Replacing an arbitrary set of rows needs the delete-fragment path the refresh commit does
+     * not yet implement; until then this precondition is what keeps row-level refresh from losing
+     * data.
+     */
+    public static boolean rowLevelReplacementIsSafe(
+            Metadata metadata,
+            Session session,
+            PlanNode viewQueryPlan,
+            SchemaTableName dataTable,
+            PassthroughColumnEquivalences columnEquivalences,
+            Set<String> storagePartitionColumns,
+            Lookup lookup)
+    {
+        if (storagePartitionColumns.isEmpty()) {
+            return false;
+        }
+        if (!searchFrom(viewQueryPlan, lookup).where(JoinNode.class::isInstance).findAll().isEmpty()) {
+            return false;
+        }
+
+        List<PlanNode> aggregations = searchFrom(viewQueryPlan, lookup)
+                .where(node -> node instanceof AggregationNode && !((AggregationNode) node).getGroupingKeys().isEmpty())
+                .findAll();
+        if (aggregations.size() != 1) {
+            return false;
+        }
+
+        Map<VariableReferenceExpression, TableColumn> baseColumns =
+                resolveBaseColumnsByVariable(metadata, session, viewQueryPlan, lookup);
+
+        ImmutableSet.Builder<String> groupingStorageColumns = ImmutableSet.builder();
+        for (VariableReferenceExpression groupingKey : ((AggregationNode) aggregations.get(0)).getGroupingKeys()) {
+            TableColumn baseColumn = baseColumns.get(groupingKey);
+            if (baseColumn == null) {
+                return false;
+            }
+            Optional<String> storageColumn =
+                    columnEquivalences.getStorageColumnName(dataTable, baseColumn.getTableName(), baseColumn.getColumnName());
+            if (!storageColumn.isPresent()) {
+                return false;
+            }
+            groupingStorageColumns.add(storageColumn.get());
+        }
+        return groupingStorageColumns.build().equals(storagePartitionColumns);
+    }
+
     private static TableScanNode findTableScan(
             Metadata metadata,
             Session session,
@@ -956,6 +1012,30 @@ public class DifferentialPlanRewriter
             Lookup lookup,
             WarningCollector warningCollector)
     {
+        return buildDeltaPlanForRefresh(node, metadata, session, idAllocator, variableAllocator, constraints, ImmutableMap.of(), columnEquivalences, lookup, warningCollector);
+    }
+
+    /**
+     * Builds the delta a refresh writes.
+     *
+     * <p>With row-level changed-rows predicates the delta recomputes only the groups the connector
+     * reports as changed, instead of every group in a stale partition. The caller is responsible for
+     * having established that the storage table can have exactly those groups replaced -- see
+     * {@link #rowLevelReplacementIsSafe} -- because the refresh commits by replacing the partitions
+     * of the files it wrote, which silently discards anything else those partitions held.
+     */
+    public static Optional<PlanNode> buildDeltaPlanForRefresh(
+            RefreshMaterializedViewNode node,
+            Metadata metadata,
+            Session session,
+            PlanNodeIdAllocator idAllocator,
+            VariableAllocator variableAllocator,
+            Map<SchemaTableName, List<TupleDomain<String>>> constraints,
+            Map<SchemaTableName, ChangedRowsPredicate> changedRowsPredicates,
+            PassthroughColumnEquivalences columnEquivalences,
+            Lookup lookup,
+            WarningCollector warningCollector)
+    {
         PlanNode sourcePlan = node.getSource();
 
         Map<VariableReferenceExpression, VariableReferenceExpression> identityMapping =
@@ -968,6 +1048,7 @@ public class DifferentialPlanRewriter
                 idAllocator,
                 variableAllocator,
                 constraints,
+                changedRowsPredicates,
                 columnEquivalences,
                 lookup,
                 warningCollector);

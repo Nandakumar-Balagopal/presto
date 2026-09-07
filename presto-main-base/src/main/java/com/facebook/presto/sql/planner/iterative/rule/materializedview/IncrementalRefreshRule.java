@@ -20,6 +20,7 @@ import com.facebook.presto.common.predicate.TupleDomain;
 import com.facebook.presto.matching.Captures;
 import com.facebook.presto.matching.Pattern;
 import com.facebook.presto.metadata.Metadata;
+import com.facebook.presto.spi.ChangedRowsPredicate;
 import com.facebook.presto.spi.ColumnHandle;
 import com.facebook.presto.spi.ColumnMetadata;
 import com.facebook.presto.spi.MaterializedViewDefinition;
@@ -52,13 +53,16 @@ import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.ImmutableSet;
 
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 
 import static com.facebook.presto.SystemSessionProperties.getMaterializedViewDefaultRefreshType;
 import static com.facebook.presto.SystemSessionProperties.getMaterializedViewIncrementalRefreshStrategy;
+import static com.facebook.presto.SystemSessionProperties.getMaterializedViewRowLevelIncrementalStrategy;
 import static com.facebook.presto.SystemSessionProperties.isLegacyMaterializedViews;
 import static com.facebook.presto.expressions.LogicalRowExpressions.and;
 import static com.facebook.presto.spi.MaterializedViewStatus.MaterializedDataPredicates;
@@ -69,6 +73,8 @@ import static com.facebook.presto.sql.planner.plan.AssignmentUtils.identityAssig
 import static com.facebook.presto.sql.planner.plan.Patterns.refreshMaterializedViewNode;
 import static com.google.common.collect.ImmutableList.toImmutableList;
 import static com.google.common.collect.ImmutableMap.toImmutableMap;
+import static com.google.common.collect.ImmutableSet.toImmutableSet;
+import static java.util.Locale.ENGLISH;
 import static java.util.Objects.requireNonNull;
 
 /**
@@ -92,6 +98,13 @@ public class IncrementalRefreshRule
         implements Rule<RefreshMaterializedViewNode>
 {
     private static final Pattern<RefreshMaterializedViewNode> PATTERN = refreshMaterializedViewNode();
+    /**
+     * The table property connectors expose their partition columns under. Named here rather than
+     * imported because the engine cannot depend on a connector; it matches Iceberg's
+     * IcebergTableProperties.PARTITIONING_PROPERTY, and an absent or differently named property
+     * simply reads as unpartitioned, which keeps the refresh at partition-level.
+     */
+    private static final String PARTITIONING_PROPERTY = "partitioning";
 
     private final Metadata metadata;
 
@@ -143,16 +156,10 @@ public class IncrementalRefreshRule
 
         MaterializedViewStatus status = metadataResolver.getMaterializedViewStatus(qualifiedViewName, TupleDomain.all());
 
-        // No capability check here. This rule builds no row-level plan, so refusing to refresh
-        // when the storage table cannot replace affected rows only downgraded the refresh it could
-        // still do: a base table with row lineage reported row-level changes, no connector declares
-        // supportsMaterializedViewRowLevelRefresh, and the refresh fell all the way back to a full
-        // recompute -- strictly worse than the partition-level refresh the same table would have got
-        // without row lineage. Partition-level staleness covers row-level changes too, because the
-        // connector derives changed partitions over the same snapshot range.
-        //
-        // When this rule gains a row-level plan the check belongs at that choice, gating row-level
-        // against partition-level, not gating refresh as a whole.
+        // Row-level eligibility is decided below, against the storage table's partitioning, rather
+        // than by a blanket capability check here. Bailing out at this point used to send a base
+        // table with row lineage all the way to a full recompute -- strictly worse than the
+        // partition-level refresh the same table would have received without it.
 
         // If fully materialized, nothing to refresh - return empty result
         if (status.isFullyMaterialized()) {
@@ -173,16 +180,49 @@ public class IncrementalRefreshRule
             return Result.ofPlanNode(node.getSource());
         }
 
-        // If no partition info available (unpartitioned tables or connector doesn't track partitions),
-        // fall back to full refresh since we can't determine which partitions are stale
+        SchemaTableName dataTable = new SchemaTableName(materializedViewDefinition.get().getSchema(), materializedViewDefinition.get().getTable());
+        PassthroughColumnEquivalences columnEquivalences = new PassthroughColumnEquivalences(materializedViewDefinition.get(), dataTable);
+
+        // Row-level refresh recomputes only the changed groups. Safe to commit only when the storage
+        // table is partitioned by exactly the view's grouping columns, because the refresh replaces
+        // the partitions of the files it writes; see rowLevelReplacementIsSafe.
+        Map<SchemaTableName, ChangedRowsPredicate> rowLevelPredicates = ImmutableMap.of();
+        // hasPartitionRefreshData is required even though row-level staleness needs no partition
+        // metadata, because the connector decides how to commit from the same signal: without it,
+        // Iceberg treats the refresh as a full rewrite and overwrites the storage table by
+        // alwaysTrue(), which would discard every group the row-level delta did not recompute.
+        // Writing a partial delta is only safe once the commit replaces partitions instead.
+        if (status.hasRowLevelChanges()
+                && status.hasPartitionRefreshData()
+                && getMaterializedViewRowLevelIncrementalStrategy(session) != MaterializedViewRewriteStrategy.NEVER) {
+            if (DifferentialPlanRewriter.rowLevelReplacementIsSafe(
+                    metadata,
+                    session,
+                    node.getSource(),
+                    dataTable,
+                    columnEquivalences,
+                    storagePartitionColumns(metadata, session, storageTableHandle),
+                    context.getLookup())) {
+                rowLevelPredicates = status.getChangedRowsPredicates();
+            }
+            else {
+                context.getWarningCollector().add(new PrestoWarning(
+                        MATERIALIZED_VIEW_STITCHING_FALLBACK,
+                        "Cannot perform row-level incremental refresh for materialized view " + qualifiedViewName +
+                                ": the storage table is not partitioned by the view's grouping columns, so only whole " +
+                                "partitions can be replaced. Falling back to partition-level incremental refresh."));
+            }
+        }
+
+        // Without partition data the connector commits a refresh by overwriting the whole storage
+        // table, so no partial delta of any granularity can be written safely.
         if (!status.hasPartitionRefreshData()) {
-            String reason = !status.hasRowLevelChanges()
-                    ? "no partition-level staleness available (unpartitioned base, untracked partitions, or non-append base changes)"
-                    : "row-level changes are available but affected-identifier storage stitching is not supported for this materialized view";
             context.getWarningCollector().add(new PrestoWarning(
                     MATERIALIZED_VIEW_STITCHING_FALLBACK,
                     "Cannot perform incremental refresh for materialized view " + qualifiedViewName +
-                            ": " + reason + ". Falling back to full refresh."));
+                            ": no partition-level staleness available (unpartitioned base, untracked partitions, or " +
+                            "non-append base changes), and the refresh commit replaces the whole storage table without " +
+                            "it. Falling back to full refresh."));
             return Result.ofPlanNode(node.getSource());
         }
 
@@ -199,9 +239,6 @@ public class IncrementalRefreshRule
         Map<SchemaTableName, TupleDomain<ColumnHandle>> refreshBounds = status.getChangedRowsPredicates().entrySet().stream()
                 .filter(entry -> !entry.getValue().getRefreshBound().isAll())
                 .collect(toImmutableMap(Map.Entry::getKey, entry -> entry.getValue().getRefreshBound()));
-
-        SchemaTableName dataTable = new SchemaTableName(materializedViewDefinition.get().getSchema(), materializedViewDefinition.get().getTable());
-        PassthroughColumnEquivalences columnEquivalences = new PassthroughColumnEquivalences(materializedViewDefinition.get(), dataTable);
 
         Map<SchemaTableName, List<TupleDomain<String>>> filteredConstraints =
                 filterToValidRefreshColumns(materializedViewDefinition.get(), constraints, columnEquivalences, dataTable);
@@ -222,6 +259,7 @@ public class IncrementalRefreshRule
                 idAllocator,
                 variableAllocator,
                 filteredConstraints,
+                rowLevelPredicates,
                 columnEquivalences,
                 context.getLookup(),
                 context.getWarningCollector());
@@ -254,6 +292,21 @@ public class IncrementalRefreshRule
         }
 
         return Result.ofPlanNode(deltaWithPredicates);
+    }
+
+    /**
+     * The storage table's partition column names, as the connector reports them.
+     */
+    private static Set<String> storagePartitionColumns(Metadata metadata, Session session, TableHandle storageTableHandle)
+    {
+        Object partitioning = metadata.getTableMetadata(session, storageTableHandle).getMetadata().getProperties().get(PARTITIONING_PROPERTY);
+        if (!(partitioning instanceof Collection)) {
+            return ImmutableSet.of();
+        }
+        return ((Collection<?>) partitioning).stream()
+                .map(String::valueOf)
+                .map(column -> column.toLowerCase(ENGLISH))
+                .collect(toImmutableSet());
     }
 
     /**
