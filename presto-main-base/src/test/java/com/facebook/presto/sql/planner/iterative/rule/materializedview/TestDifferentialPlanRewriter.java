@@ -516,8 +516,6 @@ public class TestDifferentialPlanRewriter
                 "Case B should match current rows to the affected groups");
     }
 
-
-
     @Test
     public void testFreshBranchAntiJoinsAffectedIdentifiers()
     {

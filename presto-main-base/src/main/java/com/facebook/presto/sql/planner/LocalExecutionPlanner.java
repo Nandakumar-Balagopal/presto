@@ -62,7 +62,6 @@ import com.facebook.presto.operator.EnforceSingleRowOperator;
 import com.facebook.presto.operator.ExplainAnalyzeOperator.ExplainAnalyzeOperatorFactory;
 import com.facebook.presto.operator.FilterAndProjectOperator.FilterAndProjectOperatorFactory;
 import com.facebook.presto.operator.FragmentResultCacheManager;
-import com.facebook.presto.operator.RefreshMaterializedViewCommit;
 import com.facebook.presto.operator.GroupIdOperator;
 import com.facebook.presto.operator.HashAggregationOperator.HashAggregationOperatorFactory;
 import com.facebook.presto.operator.HashBuilderOperator.HashBuilderOperatorFactory;
@@ -91,6 +90,7 @@ import com.facebook.presto.operator.PagesSpatialIndexFactory;
 import com.facebook.presto.operator.PartitionFunction;
 import com.facebook.presto.operator.PartitionedLookupSourceFactory;
 import com.facebook.presto.operator.PipelineExecutionStrategy;
+import com.facebook.presto.operator.RefreshMaterializedViewCommit;
 import com.facebook.presto.operator.RegularTableFunctionPartition;
 import com.facebook.presto.operator.RemoteProjectOperator.RemoteProjectOperatorFactory;
 import com.facebook.presto.operator.RowNumberOperator;
@@ -3701,33 +3701,33 @@ public class LocalExecutionPlanner
             @Override
             public Optional<ConnectorOutputMetadata> finishTable(Collection<Slice> fragments, Collection<ComputedStatistics> statistics)
             {
-            if (target instanceof CreateHandle) {
-                return metadata.finishCreateTable(session, ((CreateHandle) target).getHandle(), fragments, statistics);
-            }
-            else if (target instanceof InsertHandle) {
-                return metadata.finishInsert(session, ((InsertHandle) target).getHandle(), fragments, statistics);
-            }
-            else if (target instanceof DeleteHandle) {
-                return metadata.finishDeleteWithOutput(session, ((DeleteHandle) target).getHandle(), fragments);
-            }
-            else if (target instanceof RefreshMaterializedViewHandle) {
-                return metadata.finishRefreshMaterializedView(session, ((RefreshMaterializedViewHandle) target).getHandle(), fragments, statistics);
-            }
-            else if (target instanceof UpdateHandle) {
-                metadata.finishUpdate(session, ((UpdateHandle) target).getHandle(), fragments);
-                return Optional.empty();
-            }
-            else if (target instanceof MergeHandle) {
-                metadata.finishMerge(session, ((MergeHandle) target).getHandle(), fragments, statistics);
-                return Optional.empty();
-            }
-            else if (target instanceof ExecuteProcedureHandle) {
-                metadata.finishCallDistributedProcedure(session, ((ExecuteProcedureHandle) target).getHandle(), ((ExecuteProcedureHandle) target).getProcedureName(), fragments);
-                return Optional.empty();
-            }
-            else {
-                throw new AssertionError("Unhandled target type: " + target.getClass().getName());
-            }
+                if (target instanceof CreateHandle) {
+                    return metadata.finishCreateTable(session, ((CreateHandle) target).getHandle(), fragments, statistics);
+                }
+                else if (target instanceof InsertHandle) {
+                    return metadata.finishInsert(session, ((InsertHandle) target).getHandle(), fragments, statistics);
+                }
+                else if (target instanceof DeleteHandle) {
+                    return metadata.finishDeleteWithOutput(session, ((DeleteHandle) target).getHandle(), fragments);
+                }
+                else if (target instanceof RefreshMaterializedViewHandle) {
+                    return metadata.finishRefreshMaterializedView(session, ((RefreshMaterializedViewHandle) target).getHandle(), fragments, statistics);
+                }
+                else if (target instanceof UpdateHandle) {
+                    metadata.finishUpdate(session, ((UpdateHandle) target).getHandle(), fragments);
+                    return Optional.empty();
+                }
+                else if (target instanceof MergeHandle) {
+                    metadata.finishMerge(session, ((MergeHandle) target).getHandle(), fragments, statistics);
+                    return Optional.empty();
+                }
+                else if (target instanceof ExecuteProcedureHandle) {
+                    metadata.finishCallDistributedProcedure(session, ((ExecuteProcedureHandle) target).getHandle(), ((ExecuteProcedureHandle) target).getProcedureName(), fragments);
+                    return Optional.empty();
+                }
+                else {
+                    throw new AssertionError("Unhandled target type: " + target.getClass().getName());
+                }
             }
 
             @Override

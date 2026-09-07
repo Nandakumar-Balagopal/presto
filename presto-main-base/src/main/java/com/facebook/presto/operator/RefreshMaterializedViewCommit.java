@@ -12,18 +12,36 @@
  * limitations under the License.
  */
 package com.facebook.presto.operator;
+
 import io.airlift.slice.Slice;
+
 import java.util.Collection;
+
 import static java.util.Objects.requireNonNull;
+
+/**
+ * The two fragment sets an atomic materialized view refresh commits together: the rows to remove
+ * from the storage table and the rows to add. Committing them in one operation is what keeps a
+ * refresh from exposing a state where affected rows are missing.
+ */
 public final class RefreshMaterializedViewCommit
 {
     private final Collection<Slice> deleteFragments;
     private final Collection<Slice> insertFragments;
+
     public RefreshMaterializedViewCommit(Collection<Slice> deleteFragments, Collection<Slice> insertFragments)
     {
         this.deleteFragments = requireNonNull(deleteFragments, "deleteFragments is null");
         this.insertFragments = requireNonNull(insertFragments, "insertFragments is null");
     }
-    public Collection<Slice> getDeleteFragments() { return deleteFragments; }
-    public Collection<Slice> getInsertFragments() { return insertFragments; }
+
+    public Collection<Slice> getDeleteFragments()
+    {
+        return deleteFragments;
+    }
+
+    public Collection<Slice> getInsertFragments()
+    {
+        return insertFragments;
+    }
 }

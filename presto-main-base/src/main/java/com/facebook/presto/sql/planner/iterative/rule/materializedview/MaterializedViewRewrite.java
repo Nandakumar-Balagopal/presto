@@ -51,9 +51,9 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 
+import static com.facebook.presto.SystemSessionProperties.getMaterializedViewRowLevelIncrementalStrategy;
 import static com.facebook.presto.SystemSessionProperties.getMaterializedViewStaleReadBehavior;
 import static com.facebook.presto.SystemSessionProperties.getMaterializedViewStalenessWindow;
-import static com.facebook.presto.SystemSessionProperties.getMaterializedViewRowLevelIncrementalStrategy;
 import static com.facebook.presto.SystemSessionProperties.getMaterializedViewStitchingStrategy;
 import static com.facebook.presto.SystemSessionProperties.isLegacyMaterializedViews;
 import static com.facebook.presto.SystemSessionProperties.isMaterializedViewForceStale;
