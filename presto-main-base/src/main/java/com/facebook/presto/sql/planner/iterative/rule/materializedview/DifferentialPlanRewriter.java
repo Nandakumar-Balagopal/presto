@@ -910,6 +910,32 @@ public class DifferentialPlanRewriter
     }
 
     /**
+     * The affected-groups relation used by Case B expansion, with its key variables ordered to match
+     * the aggregation's grouping keys.
+     */
+    private static class AffectedGroups
+    {
+        private final PlanNode node;
+        private final List<VariableReferenceExpression> keys;
+
+        AffectedGroups(PlanNode node, List<VariableReferenceExpression> keys)
+        {
+            this.node = requireNonNull(node, "node is null");
+            this.keys = ImmutableList.copyOf(requireNonNull(keys, "keys is null"));
+        }
+
+        PlanNode getNode()
+        {
+            return node;
+        }
+
+        List<VariableReferenceExpression> getKeys()
+        {
+            return keys;
+        }
+    }
+
+    /**
      * The {@code affected_identifiers} relation, the variable each identifier column is bound to,
      * and the marker column that makes the anti-join's unmatched side detectable.
      */
@@ -1395,23 +1421,39 @@ public class DifferentialPlanRewriter
             checkState(!deltaGroupingKeys.contains(null) && !currentGroupingKeys.contains(null),
                     "Missing grouping-key mapping for expanded materialized view delta");
 
-            AggregationNode affectedGroups = new AggregationNode(
-                    aggregation.getSourceLocation(),
-                    idAllocator.getNextId(),
-                    child.delta().getNode(),
-                    ImmutableMap.of(),
-                    new AggregationNode.GroupingSetDescriptor(deltaGroupingKeys, 1, ImmutableSet.of()),
-                    ImmutableList.of(),
-                    SINGLE,
-                    Optional.empty(),
-                    Optional.empty(),
-                    Optional.empty());
+            // Which groups are affected has to be decided the same way on both branches. The fresh
+            // branch anti-joins against affected_identifiers, built from the base rows the connector
+            // reports as changed, with no view predicate applied. Deriving the delta's affected
+            // groups from child.delta() instead would apply every filter between the leaf and this
+            // aggregation, so a changed row that the view's own WHERE rejects would leave its group
+            // excluded from the fresh branch and never recomputed here -- the group would vanish.
+            Optional<AffectedGroups> rowLevel = rowLevelAffectedGroups(aggregation);
+            PlanNode affectedGroups;
+            List<VariableReferenceExpression> affectedGroupKeys;
+            if (rowLevel.isPresent()) {
+                affectedGroups = rowLevel.get().getNode();
+                affectedGroupKeys = rowLevel.get().getKeys();
+            }
+            else {
+                affectedGroups = new AggregationNode(
+                        aggregation.getSourceLocation(),
+                        idAllocator.getNextId(),
+                        child.delta().getNode(),
+                        ImmutableMap.of(),
+                        new AggregationNode.GroupingSetDescriptor(deltaGroupingKeys, 1, ImmutableSet.of()),
+                        ImmutableList.of(),
+                        SINGLE,
+                        Optional.empty(),
+                        Optional.empty(),
+                        Optional.empty());
+                affectedGroupKeys = deltaGroupingKeys;
+            }
 
             FunctionResolution functionResolution = new FunctionResolution(metadata.getFunctionAndTypeManager().getFunctionAndTypeResolver());
             List<RowExpression> matches = new ArrayList<>();
             for (int index = 0; index < currentGroupingKeys.size(); index++) {
                 VariableReferenceExpression currentKey = currentGroupingKeys.get(index);
-                VariableReferenceExpression affectedKey = deltaGroupingKeys.get(index);
+                VariableReferenceExpression affectedKey = affectedGroupKeys.get(index);
                 matches.add(new CallExpression(
                         "NOT",
                         functionResolution.notFunction(),
@@ -1453,6 +1495,64 @@ public class DifferentialPlanRewriter
                             assignments.build(),
                             ProjectNode.Locality.LOCAL),
                     current.getMapping());
+        }
+
+        /**
+         * The affected groups for a row-level leaf: the grouping columns of the base rows the
+         * connector reports as changed, with no view predicate applied, matching exactly what the
+         * fresh branch anti-joins against. Empty when this aggregation does not sit over a single
+         * row-level base whose grouping keys all resolve to its columns, in which case the caller
+         * falls back to deriving the groups from the delta variant.
+         */
+        private Optional<AffectedGroups> rowLevelAffectedGroups(AggregationNode aggregation)
+        {
+            if (changedRowsPredicates.isEmpty()) {
+                return Optional.empty();
+            }
+            List<PlanNode> scans = searchFrom(aggregation.getSource(), lookup)
+                    .where(TableScanNode.class::isInstance)
+                    .findAll();
+            if (scans.size() != 1) {
+                return Optional.empty();
+            }
+            TableScanNode baseScan = (TableScanNode) scans.get(0);
+            SchemaTableName tableName = metadata.getTableMetadata(session, baseScan.getTable()).getTable();
+            ChangedRowsPredicate changedRows = changedRowsPredicates.get(tableName);
+            if (changedRows == null || changedRows.getDataDisjuncts().isEmpty()) {
+                return Optional.empty();
+            }
+
+            Map<VariableReferenceExpression, TableColumn> baseColumns =
+                    resolveBaseColumnsByVariable(metadata, session, aggregation.getSource(), lookup);
+            Map<String, ColumnHandle> columnHandles = metadata.getColumnHandles(session, baseScan.getTable());
+
+            List<String> groupingColumnNames = new ArrayList<>();
+            ImmutableMap.Builder<String, ColumnHandle> identifierColumns = ImmutableMap.builder();
+            for (VariableReferenceExpression groupingKey : aggregation.getGroupingKeys()) {
+                TableColumn baseColumn = baseColumns.get(groupingKey);
+                if (baseColumn == null || !baseColumn.getTableName().equals(tableName)) {
+                    return Optional.empty();
+                }
+                ColumnHandle handle = columnHandles.get(baseColumn.getColumnName());
+                if (handle == null) {
+                    return Optional.empty();
+                }
+                groupingColumnNames.add(baseColumn.getColumnName());
+                identifierColumns.put(baseColumn.getColumnName(), handle);
+            }
+
+            AffectedIdentifiers affected = buildAffectedIdentifiers(
+                    metadata,
+                    session,
+                    baseScan,
+                    changedRows.getDataDisjuncts(),
+                    identifierColumns.buildKeepingLast(),
+                    idAllocator,
+                    variableAllocator);
+
+            return Optional.of(new AffectedGroups(
+                    affected.getNode(),
+                    groupingColumnNames.stream().map(affected::getIdentifier).collect(toImmutableList())));
         }
 
         private NodeWithMapping buildAggregation(AggregationNode original, NodeWithMapping source)

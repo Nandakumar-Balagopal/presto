@@ -422,6 +422,70 @@ public class TestIcebergRowLevelRefreshEdgeCases
         }
     }
 
+    /**
+     * A stale read of a filtered view where the appended row does not survive the view's own filter.
+     * affected_identifiers is built from a raw base scan, so the group is marked affected even though
+     * nothing about its aggregate changed; the delta branch must then recompute it back correctly.
+     */
+    @Test
+    public void testStaleReadOfFilteredViewWhenAppendFailsTheFilter()
+    {
+        String base = "flt_base";
+        String view = "flt_mv";
+        try {
+            create(base, "region varchar, amount bigint", "ARRAY['region']");
+            assertQuerySucceeds("INSERT INTO " + base + " VALUES ('NA', 10), ('EU', 20), ('NA', 30)");
+            createView(view, base, "ARRAY['region']",
+                    "SELECT region, SUM(amount) AS total FROM " + base + " WHERE amount > 0 GROUP BY region");
+            refreshExpectingFallback(view);
+
+            // Appended row is excluded by the view's filter, so no aggregate actually changes.
+            assertQuerySucceeds("INSERT INTO " + base + " VALUES ('EU', -5)");
+
+            assertEquals(
+                    computeActual(stitchSession(), "SELECT region, total FROM " + view + " ORDER BY region").getMaterializedRows(),
+                    computeActual("SELECT region, SUM(amount) FROM " + base + " WHERE amount > 0 GROUP BY region ORDER BY region").getMaterializedRows(),
+                    "stale read of a filtered view disagrees with the base");
+
+            // And the same through a refresh.
+            refreshExpectingRowLevel(view);
+            assertViewMatchesBase(
+                    "SELECT region, total FROM " + view + " ORDER BY region",
+                    "SELECT region, SUM(amount) FROM " + base + " WHERE amount > 0 GROUP BY region ORDER BY region");
+        }
+        finally {
+            drop(view, base);
+        }
+    }
+
+    /**
+     * A group every one of whose rows fails the view's filter must not appear, before or after a
+     * row-level refresh touches it.
+     */
+    @Test
+    public void testGroupEntirelyExcludedByViewFilter()
+    {
+        String base = "allflt_base";
+        String view = "allflt_mv";
+        try {
+            create(base, "region varchar, amount bigint", "ARRAY['region']");
+            assertQuerySucceeds("INSERT INTO " + base + " VALUES ('NA', 10), ('EU', -1)");
+            createView(view, base, "ARRAY['region']",
+                    "SELECT region, SUM(amount) AS total FROM " + base + " WHERE amount > 0 GROUP BY region");
+            refreshExpectingFallback(view);
+
+            assertQuerySucceeds("INSERT INTO " + base + " VALUES ('EU', -2), ('NA', 5)");
+            refreshExpectingRowLevel(view);
+
+            assertViewMatchesBase(
+                    "SELECT region, total FROM " + view + " ORDER BY region",
+                    "SELECT region, SUM(amount) FROM " + base + " WHERE amount > 0 GROUP BY region ORDER BY region");
+        }
+        finally {
+            drop(view, base);
+        }
+    }
+
     // ------------------------------------------------------------- boilerplate
 
     private void run(
