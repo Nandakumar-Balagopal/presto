@@ -179,7 +179,7 @@ public class Changes
                     QualifiedObjectName.valueOf(tableName),
                     ImmutableSet.of(new Subfield("$row_id", ImmutableList.of())));
             projectedColumns.add(rowIdHandle);
-            outputColumns.add(new Descriptor.Field("$row_id", Optional.of(metadata.getMetadataResolver(engineSession).getColumnMetadata(tableHandle, rowIdHandle).getType())));
+            outputColumns.add(new Descriptor.Field("$row_id", Optional.of(metadata.getColumnMetadata(engineSession, tableHandle, rowIdHandle).getType())));
         }
         outputColumns.add(new Descriptor.Field("change_kind", Optional.of(ChangeKindEnumType.CHANGE_KIND)));
 

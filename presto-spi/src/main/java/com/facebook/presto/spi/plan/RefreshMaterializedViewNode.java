@@ -25,7 +25,9 @@ import java.util.Collections;
 import java.util.List;
 import java.util.Optional;
 
+import static java.util.Arrays.asList;
 import static java.util.Collections.singletonList;
+import static java.util.Collections.unmodifiableList;
 import static java.util.Objects.requireNonNull;
 
 /**
@@ -117,7 +119,7 @@ public final class RefreshMaterializedViewNode
     public List<PlanNode> getSources()
     {
         if (deleteSource.isPresent()) {
-            return java.util.Arrays.asList(deleteSource.get(), source);
+            return unmodifiableList(asList(deleteSource.get(), source));
         }
         return singletonList(source);
     }
@@ -133,8 +135,8 @@ public final class RefreshMaterializedViewNode
                 getId(),
                 materializedViewName,
                 storageTableHandle,
-                deleteSource.isPresent() ? Optional.of(newChildren.get(0)) : Optional.empty(),
                 deleteSource.isPresent() ? newChildren.get(1) : newChildren.get(0),
+                deleteSource.isPresent() ? Optional.of(newChildren.get(0)) : Optional.empty(),
                 columnHandles,
                 outputVariables);
     }
