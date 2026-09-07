@@ -21,6 +21,7 @@ import com.facebook.presto.common.predicate.TupleDomain;
 import com.facebook.presto.metadata.Metadata;
 import com.facebook.presto.spi.ColumnHandle;
 import com.facebook.presto.spi.MaterializedViewDefinition;
+import com.facebook.presto.spi.MaterializedViewStatus;
 import com.facebook.presto.spi.SchemaTableName;
 import com.facebook.presto.spi.TableHandle;
 import com.facebook.presto.spi.VariableAllocator;
@@ -32,6 +33,7 @@ import com.facebook.presto.spi.plan.FilterNode;
 import com.facebook.presto.spi.plan.JoinNode;
 import com.facebook.presto.spi.plan.JoinType;
 import com.facebook.presto.spi.plan.LimitNode;
+import com.facebook.presto.spi.plan.MaterializedViewScanNode;
 import com.facebook.presto.spi.plan.Ordering;
 import com.facebook.presto.spi.plan.OrderingScheme;
 import com.facebook.presto.spi.plan.PlanNode;
@@ -41,6 +43,7 @@ import com.facebook.presto.spi.plan.SortNode;
 import com.facebook.presto.spi.plan.TableScanNode;
 import com.facebook.presto.spi.plan.TopNNode;
 import com.facebook.presto.spi.plan.UnionNode;
+import com.facebook.presto.spi.relation.SpecialFormExpression;
 import com.facebook.presto.spi.relation.VariableReferenceExpression;
 import com.facebook.presto.sql.planner.iterative.Lookup;
 import com.facebook.presto.testing.LocalQueryRunner;
@@ -64,6 +67,7 @@ import static com.facebook.presto.spi.plan.JoinType.LEFT;
 import static com.facebook.presto.testing.TestingSession.testSessionBuilder;
 import static io.airlift.slice.Slices.utf8Slice;
 import static org.testng.Assert.assertEquals;
+import static org.testng.Assert.assertFalse;
 import static org.testng.Assert.assertNotNull;
 import static org.testng.Assert.assertTrue;
 
@@ -508,6 +512,126 @@ public class TestDifferentialPlanRewriter
                 "Case B should match current rows to the affected groups");
     }
 
+
+
+    @Test
+    public void testFreshBranchAntiJoinsAffectedIdentifiers()
+    {
+        // customer stands in for the MV storage table and orders for the single stale base. custkey
+        // is the identifier: it exists on both, with the same type, so it can key the anti-join.
+        TableScanNode storage = createCustomerTableScan();
+        TableScanNode base = createOrdersTableScanWithCustkey();
+
+        Optional<PlanNode> stitched = stitch(storage, base, ImmutableList.of(
+                TupleDomain.withColumnDomains(ImmutableMap.of("custkey", Domain.singleValue(BIGINT, 1L)))));
+
+        assertTrue(stitched.isPresent(), "expected a stitched plan");
+        UnionNode union = (UnionNode) stitched.get();
+
+        // fresh branch: project -> filter(marker IS NULL) -> LEFT join
+        ProjectNode freshProject = (ProjectNode) union.getSources().get(0);
+        FilterNode unmatched = (FilterNode) freshProject.getSource();
+        assertTrue(unmatched.getPredicate() instanceof SpecialFormExpression
+                        && ((SpecialFormExpression) unmatched.getPredicate()).getForm() == SpecialFormExpression.Form.IS_NULL,
+                "fresh branch keeps the rows that did not match affected_identifiers, got: " + unmatched.getPredicate());
+
+        JoinNode antiJoin = (JoinNode) unmatched.getSource();
+        assertEquals(antiJoin.getType(), LEFT, "anti-join must preserve unmatched storage rows");
+        assertTrue(antiJoin.getCriteria().isEmpty(), "identifiers are matched null-safely, not by equi-criteria");
+        assertTrue(antiJoin.getFilter().isPresent(), "anti-join must carry the null-safe match predicate");
+        assertTrue(antiJoin.getFilter().get().toString().contains("IS_DISTINCT_FROM"),
+                "a null identifier is a group of its own and must still match, got: " + antiJoin.getFilter().get());
+        assertEquals(antiJoin.getLeft(), storage, "the storage table is the preserved side");
+
+        // affected_identifiers: project(marker) -> distinct -> filter -> scan of the stale base
+        ProjectNode marked = (ProjectNode) antiJoin.getRight();
+        AggregationNode distinct = (AggregationNode) marked.getSource();
+        assertTrue(distinct.getAggregations().isEmpty(), "affected_identifiers is a DISTINCT, not an aggregation");
+        assertEquals(distinct.getGroupingKeys().size(), 1, "one identifier column");
+        FilterNode changedRows = (FilterNode) distinct.getSource();
+        TableScanNode affectedScan = (TableScanNode) changedRows.getSource();
+        assertEquals(metadata.getTableMetadata(session, affectedScan.getTable()).getTable(), ORDERS_TABLE,
+                "affected_identifiers reads the stale base table");
+    }
+
+    @Test
+    public void testStitchingDeclinedWhenStaleColumnHasNoStorageEquivalent()
+    {
+        // orderstatus is stale but maps to no storage column, so there is no anti-join key and the
+        // fresh branch cannot be constrained. Stitching must decline rather than emit a plan whose
+        // two branches overlap.
+        assertFalse(stitch(
+                createCustomerTableScan(),
+                createOrdersTableScanWithCustkey(),
+                ImmutableList.of(TupleDomain.withColumnDomains(ImmutableMap.of(
+                        "orderstatus", Domain.singleValue(VARCHAR, utf8Slice("O")))))).isPresent());
+    }
+
+    private Optional<PlanNode> stitch(TableScanNode storage, TableScanNode base, List<TupleDomain<String>> staleDisjuncts)
+    {
+        VariableReferenceExpression output = variableAllocator.newVariable("mv_key", BIGINT);
+        MaterializedViewScanNode node = new MaterializedViewScanNode(
+                Optional.empty(),
+                idAllocator.getNextId(),
+                storage,
+                base,
+                QualifiedObjectName.valueOf(CATALOG + "." + SCHEMA + ".test_mv"),
+                ImmutableMap.of(output, storage.getOutputVariables().get(0)),
+                ImmutableMap.of(output, base.getOutputVariables().get(0)),
+                ImmutableList.of(output));
+
+        return DifferentialPlanRewriter.buildStitchedPlan(
+                metadata,
+                session,
+                node,
+                ImmutableMap.of(ORDERS_TABLE, new MaterializedViewStatus.MaterializedDataPredicates(staleDisjuncts, ImmutableList.of())),
+                customerBackedMaterializedView(),
+                variableAllocator,
+                idAllocator,
+                lookup,
+                WarningCollector.NOOP);
+    }
+
+    /**
+     * A single-base materialized view stored in customer, so the storage scan's reported table name
+     * matches the definition's data table and custkey is a passthrough identifier.
+     */
+    private MaterializedViewDefinition customerBackedMaterializedView()
+    {
+        return new MaterializedViewDefinition(
+                "SELECT custkey FROM orders",
+                CUSTOMER_TABLE.getSchemaName(),
+                CUSTOMER_TABLE.getTableName(),
+                ImmutableList.of(ORDERS_TABLE),
+                Optional.empty(),
+                Optional.empty(),
+                ImmutableList.of(new MaterializedViewDefinition.ColumnMapping(
+                        new MaterializedViewDefinition.TableColumn(CUSTOMER_TABLE, "custkey"),
+                        ImmutableList.of(new MaterializedViewDefinition.TableColumn(ORDERS_TABLE, "custkey")))),
+                ImmutableList.of(),
+                Optional.empty());
+    }
+
+    private TableScanNode createOrdersTableScanWithCustkey()
+    {
+        QualifiedObjectName tableName = QualifiedObjectName.valueOf(CATALOG + "." + SCHEMA + ".orders");
+        TableHandle tableHandle = metadata.getHandleVersion(session, tableName, Optional.empty())
+                .orElseThrow(() -> new IllegalStateException("Table not found: " + tableName));
+
+        Map<String, ColumnHandle> columnHandles = metadata.getColumnHandles(session, tableHandle);
+        VariableReferenceExpression orderkey = variableAllocator.newVariable("orderkey", BIGINT);
+        VariableReferenceExpression custkey = variableAllocator.newVariable("custkey", BIGINT);
+
+        return new TableScanNode(
+                Optional.empty(),
+                idAllocator.getNextId(),
+                tableHandle,
+                ImmutableList.of(orderkey, custkey),
+                ImmutableMap.of(orderkey, columnHandles.get("orderkey"), custkey, columnHandles.get("custkey")),
+                TupleDomain.all(),
+                TupleDomain.all(),
+                Optional.empty());
+    }
 
     // Helper methods
 
