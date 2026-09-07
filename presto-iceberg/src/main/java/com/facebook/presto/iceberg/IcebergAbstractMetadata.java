@@ -1515,19 +1515,21 @@ public abstract class IcebergAbstractMetadata
         IncrementalChangelogScan scan = icebergTable.newIncrementalChangelogScan()
                 .fromSnapshotExclusive(fromSnapshotId)
                 .toSnapshot(toSnapshotId);
-        long sizeInBytes = 0;
+        // The cost picker consumes a row-count cardinality, not a byte size. estimatedRowsCount()
+        // is derived from the file's record count without opening the data file.
+        long rowCount = 0;
         try (CloseableIterable<ChangelogScanTask> tasks = scan.planFiles()) {
             for (ChangelogScanTask task : tasks) {
                 if (!(task instanceof ContentScanTask)) {
                     return OptionalLong.empty();
                 }
-                sizeInBytes = Math.addExact(sizeInBytes, ((ContentScanTask<?>) task).length());
+                rowCount = Math.addExact(rowCount, ((ContentScanTask<?>) task).estimatedRowsCount());
             }
         }
         catch (IOException | ArithmeticException e) {
             return OptionalLong.empty();
         }
-        return OptionalLong.of(sizeInBytes);
+        return OptionalLong.of(rowCount);
     }
 
     @Override
