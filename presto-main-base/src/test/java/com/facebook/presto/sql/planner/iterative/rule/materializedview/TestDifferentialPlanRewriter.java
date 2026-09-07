@@ -71,8 +71,13 @@ import static org.testng.Assert.assertTrue;
 public class TestDifferentialPlanRewriter
 {
     private static final String CATALOG = "local";
-    private static final SchemaTableName ORDERS_TABLE = new SchemaTableName("tiny", "orders");
-    private static final SchemaTableName CUSTOMER_TABLE = new SchemaTableName("tiny", "customer");
+    private static final String SCHEMA = "tiny";
+    // The rewriter keys stale constraints on the SchemaTableName the connector reports for a scan,
+    // not on the name used to address the table. TPCH canonicalizes the "tiny" schema to its scale
+    // factor, so constraints keyed on "tiny.orders" would never bind and every delta would collapse
+    // to Filter(FALSE). setUp asserts these constants still match what the connector resolves.
+    private static final SchemaTableName ORDERS_TABLE = new SchemaTableName("sf0.01", "orders");
+    private static final SchemaTableName CUSTOMER_TABLE = new SchemaTableName("sf0.01", "customer");
 
     private LocalQueryRunner queryRunner;
     private Metadata metadata;
@@ -86,7 +91,7 @@ public class TestDifferentialPlanRewriter
     {
         Session baseSession = testSessionBuilder()
                 .setCatalog(CATALOG)
-                .setSchema("tiny")
+                .setSchema(SCHEMA)
                 .build();
         queryRunner = new LocalQueryRunner(baseSession);
         queryRunner.createCatalog(CATALOG, new TpchConnectorFactory(1), ImmutableMap.of());
@@ -99,6 +104,17 @@ public class TestDifferentialPlanRewriter
         idAllocator = new PlanNodeIdAllocator();
         variableAllocator = new VariableAllocator();
         lookup = Lookup.noLookup();
+
+        assertEquals(resolveTableName("orders"), ORDERS_TABLE, "ORDERS_TABLE must match the name the connector reports, or stale constraints will not bind");
+        assertEquals(resolveTableName("customer"), CUSTOMER_TABLE, "CUSTOMER_TABLE must match the name the connector reports, or stale constraints will not bind");
+    }
+
+    private SchemaTableName resolveTableName(String table)
+    {
+        QualifiedObjectName name = QualifiedObjectName.valueOf(CATALOG + "." + SCHEMA + "." + table);
+        TableHandle handle = metadata.getHandleVersion(session, name, Optional.empty())
+                .orElseThrow(() -> new IllegalStateException("Table not found: " + name));
+        return metadata.getTableMetadata(session, handle).getTable();
     }
 
     @AfterClass(alwaysRun = true)
@@ -491,6 +507,7 @@ public class TestDifferentialPlanRewriter
         assertTrue(((ProjectNode) expandedSource).getSource() instanceof JoinNode,
                 "Case B should match current rows to the affected groups");
     }
+
 
     // Helper methods
 
