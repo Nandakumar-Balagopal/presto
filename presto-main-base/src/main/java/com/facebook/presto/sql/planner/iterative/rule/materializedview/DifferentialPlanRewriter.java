@@ -81,6 +81,7 @@ import static com.google.common.base.Preconditions.checkState;
 import static com.google.common.collect.ImmutableList.toImmutableList;
 import static com.google.common.collect.ImmutableMap.toImmutableMap;
 import static com.google.common.collect.ImmutableSet.toImmutableSet;
+import static java.lang.String.format;
 import static java.util.Objects.requireNonNull;
 import static java.util.function.Function.identity;
 
@@ -179,7 +180,6 @@ public class DifferentialPlanRewriter
             return Optional.empty();
         }
 
-        PlanNode freshPlan = buildDataTableBranch(metadata, session, node, filteredConstraints, columnEquivalences, dataTable, idAllocator, lookup);
         DifferentialPlanRewriter builder = new DifferentialPlanRewriter(
                 metadata,
                 session,
@@ -190,8 +190,13 @@ public class DifferentialPlanRewriter
                 lookup,
                 warningCollector);
 
+        PlanNode freshPlan;
         NodeWithMapping deltaResult;
         try {
+            // The fresh branch shares the column-binding logic with the delta branch, so it has to
+            // sit inside the fallback boundary too: an unstitchable plan must degrade to a full
+            // recompute rather than fail the query.
+            freshPlan = buildDataTableBranch(metadata, session, node, filteredConstraints, columnEquivalences, dataTable, idAllocator, lookup);
             deltaResult = builder.buildDeltaPlan(node.getViewQueryPlan(), node.getViewQueryMappings());
         }
         catch (UnsupportedOperationException e) {
@@ -311,20 +316,26 @@ public class DifferentialPlanRewriter
             PlanNode plan,
             Lookup lookup)
     {
-        ImmutableMap.Builder<TableColumn, VariableReferenceExpression> builder = ImmutableMap.builder();
-        searchFrom(plan, lookup)
-                .where(TableScanNode.class::isInstance)
-                .findAll()
-                .stream()
-                .map(TableScanNode.class::cast)
-                .forEach(tableScan -> {
-                    SchemaTableName tableName = metadata.getTableMetadata(session, tableScan.getTable()).getTable();
-                    for (Map.Entry<VariableReferenceExpression, ColumnHandle> entry : tableScan.getAssignments().entrySet()) {
-                        ColumnMetadata columnMetadata = metadata.getColumnMetadata(session, tableScan.getTable(), entry.getValue());
-                        builder.put(new TableColumn(tableName, columnMetadata.getName()), entry.getKey());
-                    }
-                });
-        return builder.build();
+        Map<TableColumn, VariableReferenceExpression> columnToVariable = new HashMap<>();
+        for (PlanNode node : searchFrom(plan, lookup).where(TableScanNode.class::isInstance).findAll()) {
+            TableScanNode tableScan = (TableScanNode) node;
+            SchemaTableName tableName = metadata.getTableMetadata(session, tableScan.getTable()).getTable();
+            for (Map.Entry<VariableReferenceExpression, ColumnHandle> entry : tableScan.getAssignments().entrySet()) {
+                ColumnMetadata columnMetadata = metadata.getColumnMetadata(session, tableScan.getTable(), entry.getValue());
+                TableColumn column = new TableColumn(tableName, columnMetadata.getName());
+                VariableReferenceExpression previous = columnToVariable.putIfAbsent(column, entry.getKey());
+                // Two variables bound to one base column means the subtree scans the table more than
+                // once (a self-join, say), so there is no single variable a stale predicate on that
+                // column can be rewritten to. Bail out rather than pick one arbitrarily; an
+                // ImmutableMap builder would instead throw IllegalArgumentException, which is not
+                // caught by the stitching fallback and would fail the query outright.
+                if (previous != null && !previous.equals(entry.getKey())) {
+                    throw new UnsupportedOperationException(format(
+                            "base column %s is bound to more than one variable in the plan", column));
+                }
+            }
+        }
+        return ImmutableMap.copyOf(columnToVariable);
     }
 
     private static PlanNode buildUnionNode(
@@ -492,11 +503,22 @@ public class DifferentialPlanRewriter
                     .collect(toImmutableMap(
                             entry -> metadata.getColumnMetadata(session, node.getTable(), entry.getValue()).getName(),
                             entry -> variableMapping.get(entry.getKey())));
-            List<RowExpression> predicates = stalePredicates.stream()
-                    .map(disjunct -> disjunct.transform(columnToVariable::get))
-                    .map(translator::toPredicate)
-                    .collect(toImmutableList());
-            return or(predicates);
+            ImmutableList.Builder<RowExpression> predicates = ImmutableList.builder();
+            for (TupleDomain<String> disjunct : stalePredicates) {
+                TupleDomain<VariableReferenceExpression> bound = disjunct.transform(columnToVariable::get);
+                // TupleDomain.transform silently drops columns the mapper cannot resolve, so an
+                // unbound disjunct widens to all() and toPredicate turns it into TRUE. That would
+                // make the delta branch recompute the whole base while the fresh branch still
+                // contributes rows, duplicating output and breaking the disjointness invariant.
+                if (bound.isAll()) {
+                    throw new UnsupportedOperationException(format(
+                            "stale predicate for %s is not expressible over the scanned columns",
+                            metadata.getTableMetadata(session, node.getTable()).getTable()));
+                }
+                predicates.add(translator.toPredicate(bound));
+            }
+            // An empty disjunct list means this base table is not stale, so an empty delta is correct.
+            return or(predicates.build());
         }
 
         @Override
@@ -585,11 +607,16 @@ public class DifferentialPlanRewriter
 
         private NodeWithMapping buildExpandedDelta(AggregationNode aggregation, PlanVariants child)
         {
+            // The caller also emits child.current() as this aggregation's current variant, so the
+            // expansion must read its own copy. Sharing the instance would place one subtree, with
+            // its plan node ids and variables, at two positions in the same plan.
+            NodeWithMapping current = cloneNodeWithMapping(child.current());
+
             List<VariableReferenceExpression> deltaGroupingKeys = aggregation.getGroupingKeys().stream()
                     .map(child.delta().getMapping()::get)
                     .collect(toImmutableList());
             List<VariableReferenceExpression> currentGroupingKeys = aggregation.getGroupingKeys().stream()
-                    .map(child.current().getMapping()::get)
+                    .map(current.getMapping()::get)
                     .collect(toImmutableList());
 
             checkState(!deltaGroupingKeys.contains(null) && !currentGroupingKeys.contains(null),
@@ -624,14 +651,14 @@ public class DifferentialPlanRewriter
             }
 
             List<VariableReferenceExpression> joinOutputs = ImmutableList.<VariableReferenceExpression>builder()
-                    .addAll(child.current().getNode().getOutputVariables())
+                    .addAll(current.getNode().getOutputVariables())
                     .addAll(affectedGroups.getOutputVariables())
                     .build();
             JoinNode matchingRows = new JoinNode(
                     aggregation.getSourceLocation(),
                     idAllocator.getNextId(),
                     INNER,
-                    child.current().getNode(),
+                    current.getNode(),
                     affectedGroups,
                     ImmutableList.of(),
                     joinOutputs,
@@ -642,7 +669,7 @@ public class DifferentialPlanRewriter
                     ImmutableMap.of());
 
             Assignments.Builder assignments = Assignments.builder();
-            for (VariableReferenceExpression variable : child.current().getNode().getOutputVariables()) {
+            for (VariableReferenceExpression variable : current.getNode().getOutputVariables()) {
                 assignments.put(variable, variable);
             }
             return new NodeWithMapping(
@@ -652,7 +679,7 @@ public class DifferentialPlanRewriter
                             matchingRows,
                             assignments.build(),
                             ProjectNode.Locality.LOCAL),
-                    child.current().getMapping());
+                    current.getMapping());
         }
 
         private NodeWithMapping buildAggregation(AggregationNode original, NodeWithMapping source)
