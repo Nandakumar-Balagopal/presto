@@ -31,6 +31,7 @@ import org.apache.iceberg.AddedRowsScanTask;
 import org.apache.iceberg.ChangelogScanTask;
 import org.apache.iceberg.ContentScanTask;
 import org.apache.iceberg.DataFile;
+import org.apache.iceberg.DeleteFile;
 import org.apache.iceberg.DeletedDataFileScanTask;
 import org.apache.iceberg.DeletedRowsScanTask;
 import org.apache.iceberg.IncrementalChangelogScan;
@@ -53,6 +54,7 @@ import static com.facebook.presto.iceberg.IcebergErrorCode.ICEBERG_CANNOT_OPEN_S
 import static com.facebook.presto.iceberg.IcebergSessionProperties.getMinimumAssignedSplitWeight;
 import static com.facebook.presto.iceberg.IcebergUtil.getColumns;
 import static com.facebook.presto.iceberg.IcebergUtil.getDataSequenceNumber;
+import static com.facebook.presto.iceberg.IcebergUtil.getFirstRowId;
 import static com.facebook.presto.iceberg.IcebergUtil.getPartitionKeys;
 import static com.facebook.presto.iceberg.IcebergUtil.getTargetSplitSize;
 import static com.facebook.presto.iceberg.IcebergUtil.partitionDataFromStructLike;
@@ -140,6 +142,14 @@ public class ChangelogSplitSource
         PartitionSpec spec = task.spec();
         Optional<PartitionData> partitionData = partitionDataFromStructLike(spec, task.file().partition());
 
+        // Iceberg's changelog scan rejects a snapshot range containing delete manifests outright
+        // ("Delete files are currently not supported in changelog scans"), so the reachable tasks
+        // never carry any. Fail loudly rather than silently dropping them if that ever changes,
+        // because ignoring a delete file both reports deleted rows as live and misses deletions.
+        if (!deleteFiles(task).isEmpty()) {
+            throw new PrestoException(ICEBERG_CANNOT_OPEN_SPLIT, "Change-set task unexpectedly carries delete files: " + task.getClass().getCanonicalName());
+        }
+
         return new IcebergSplit(
                 task.file().path().toString(),
                 task.start(),
@@ -157,7 +167,26 @@ public class ChangelogSplitSource
                         changeTask.commitSnapshotId(),
                         columnHandles)),
                 getDataSequenceNumber(task.file()),
-                -1L,
+                // -1 is the V1/V2 sentinel that makes the page source report a null $row_id for
+                // every position. Passing it here left the whole change set without row identity.
+                getFirstRowId(task.file()),
                 affinitySchedulingSectionSize);
+    }
+
+    private static List<DeleteFile> deleteFiles(ContentScanTask<DataFile> task)
+    {
+        if (task instanceof AddedRowsScanTask) {
+            return ((AddedRowsScanTask) task).deletes();
+        }
+        if (task instanceof DeletedRowsScanTask) {
+            return ImmutableList.<DeleteFile>builder()
+                    .addAll(((DeletedRowsScanTask) task).addedDeletes())
+                    .addAll(((DeletedRowsScanTask) task).existingDeletes())
+                    .build();
+        }
+        if (task instanceof DeletedDataFileScanTask) {
+            return ((DeletedDataFileScanTask) task).existingDeletes();
+        }
+        return ImmutableList.of();
     }
 }
