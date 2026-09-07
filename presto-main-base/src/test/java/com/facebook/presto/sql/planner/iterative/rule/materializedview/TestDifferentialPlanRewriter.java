@@ -17,8 +17,11 @@ import com.facebook.presto.Session;
 import com.facebook.presto.common.QualifiedObjectName;
 import com.facebook.presto.common.block.SortOrder;
 import com.facebook.presto.common.predicate.Domain;
+import com.facebook.presto.common.predicate.Range;
 import com.facebook.presto.common.predicate.TupleDomain;
+import com.facebook.presto.common.predicate.ValueSet;
 import com.facebook.presto.metadata.Metadata;
+import com.facebook.presto.spi.ChangedRowsPredicate;
 import com.facebook.presto.spi.ColumnHandle;
 import com.facebook.presto.spi.MaterializedViewDefinition;
 import com.facebook.presto.spi.MaterializedViewStatus;
@@ -64,6 +67,7 @@ import static com.facebook.presto.common.type.BigintType.BIGINT;
 import static com.facebook.presto.common.type.VarcharType.VARCHAR;
 import static com.facebook.presto.spi.plan.JoinType.INNER;
 import static com.facebook.presto.spi.plan.JoinType.LEFT;
+import static com.facebook.presto.sql.planner.optimizations.PlanNodeSearcher.searchFrom;
 import static com.facebook.presto.testing.TestingSession.testSessionBuilder;
 import static io.airlift.slice.Slices.utf8Slice;
 import static org.testng.Assert.assertEquals;
@@ -631,6 +635,86 @@ public class TestDifferentialPlanRewriter
                 TupleDomain.all(),
                 TupleDomain.all(),
                 Optional.empty());
+    }
+
+    @Test
+    public void testRowLevelCandidateExpandsAffectedGroups()
+    {
+        // An aggregating MV grouped on custkey, whose connector reports changed rows through a
+        // predicate on orderkey -- a column the view query does not project, standing in for
+        // Iceberg's _last_updated_sequence_number.
+        TableScanNode storage = createCustomerTableScan();
+        TableScanNode base = createOrdersTableScanWithCustkey();
+        VariableReferenceExpression custkey = base.getOutputVariables().get(1);
+        AggregationNode viewQuery = new AggregationNode(
+                Optional.empty(),
+                idAllocator.getNextId(),
+                base,
+                ImmutableMap.of(),
+                new AggregationNode.GroupingSetDescriptor(ImmutableList.of(custkey), 1, ImmutableSet.of()),
+                ImmutableList.of(),
+                AggregationNode.Step.SINGLE,
+                Optional.empty(),
+                Optional.empty(),
+                Optional.empty());
+
+        ColumnHandle orderkeyHandle = metadata.getColumnHandles(session, base.getTable()).get("orderkey");
+        Map<SchemaTableName, ChangedRowsPredicate> changedRows = ImmutableMap.of(
+                ORDERS_TABLE,
+                new ChangedRowsPredicate(
+                        ImmutableList.of(TupleDomain.withColumnDomains(ImmutableMap.of(
+                                orderkeyHandle, Domain.create(ValueSet.ofRanges(Range.greaterThan(BIGINT, 100L)), false)))),
+                        TupleDomain.all()));
+
+        VariableReferenceExpression output = variableAllocator.newVariable("mv_key", BIGINT);
+        MaterializedViewScanNode node = new MaterializedViewScanNode(
+                Optional.empty(),
+                idAllocator.getNextId(),
+                storage,
+                viewQuery,
+                QualifiedObjectName.valueOf(CATALOG + "." + SCHEMA + ".test_mv"),
+                ImmutableMap.of(output, storage.getOutputVariables().get(0)),
+                ImmutableMap.of(output, custkey),
+                ImmutableList.of(output));
+
+        Optional<PlanNode> stitched = DifferentialPlanRewriter.buildStitchedPlan(
+                metadata,
+                session,
+                node,
+                ImmutableMap.of(ORDERS_TABLE, new MaterializedViewStatus.MaterializedDataPredicates(
+                        ImmutableList.of(TupleDomain.withColumnDomains(ImmutableMap.of("custkey", Domain.singleValue(BIGINT, 1L)))),
+                        ImmutableList.of())),
+                changedRows,
+                customerBackedMaterializedView(),
+                variableAllocator,
+                idAllocator,
+                lookup,
+                WarningCollector.NOOP);
+
+        assertTrue(stitched.isPresent(), "expected a row-level stitched plan");
+        UnionNode union = (UnionNode) stitched.get();
+
+        // The fresh branch anti-joins on the grouping key, and affected_identifiers is filtered by
+        // the connector's changed-rows predicate rather than the partition disjuncts.
+        JoinNode antiJoin = (JoinNode) ((FilterNode) ((ProjectNode) union.getSources().get(0)).getSource()).getSource();
+        assertEquals(antiJoin.getType(), LEFT);
+        AggregationNode distinct = (AggregationNode) ((ProjectNode) antiJoin.getRight()).getSource();
+        FilterNode changedRowsFilter = (FilterNode) distinct.getSource();
+        assertTrue(changedRowsFilter.getPredicate().toString().contains("orderkey"),
+                "affected_identifiers must be filtered by the changed-rows predicate, got: " + changedRowsFilter.getPredicate());
+        assertEquals(distinct.getGroupingKeys().size(), 1, "the grouping key is the only identifier");
+
+        // A row-level boundary says nothing about the grouping keys, so the aggregation must take
+        // Case B expansion: recompute whole affected groups from the current base.
+        PlanNode deltaBranch = union.getSources().get(1);
+        AggregationNode deltaAggregation = (AggregationNode) searchFrom(deltaBranch, lookup)
+                .where(AggregationNode.class::isInstance)
+                .findFirst()
+                .orElseThrow(() -> new AssertionError("delta branch should aggregate"));
+        assertTrue(deltaAggregation.getSource() instanceof ProjectNode,
+                "Case B projects the current rows after matching affected groups, got: " + deltaAggregation.getSource().getClass().getSimpleName());
+        assertTrue(((ProjectNode) deltaAggregation.getSource()).getSource() instanceof JoinNode,
+                "Case B matches current rows against the affected groups");
     }
 
     // Helper methods

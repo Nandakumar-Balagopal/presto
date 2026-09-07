@@ -20,6 +20,7 @@ import com.facebook.presto.common.predicate.TupleDomain;
 import com.facebook.presto.common.type.BooleanType;
 import com.facebook.presto.metadata.Metadata;
 import com.facebook.presto.spi.ColumnHandle;
+import com.facebook.presto.spi.ChangedRowsPredicate;
 import com.facebook.presto.spi.ColumnMetadata;
 import com.facebook.presto.spi.MaterializedViewDefinition;
 import com.facebook.presto.spi.MaterializedViewDefinition.TableColumn;
@@ -64,6 +65,7 @@ import com.google.common.collect.ListMultimap;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -129,6 +131,7 @@ public class DifferentialPlanRewriter
     private final RowExpressionDomainTranslator translator;
     private final RowExpressionDeterminismEvaluator determinismEvaluator;
     private final Map<SchemaTableName, List<TupleDomain<String>>> staleConstraints;
+    private final Map<SchemaTableName, ChangedRowsPredicate> changedRowsPredicates;
     private final PassthroughColumnEquivalences columnEquivalences;
     private final Lookup lookup;
     private final WarningCollector warningCollector;
@@ -143,6 +146,25 @@ public class DifferentialPlanRewriter
             Lookup lookup,
             WarningCollector warningCollector)
     {
+        this(metadata, session, idAllocator, variableAllocator, staleConstraints, ImmutableMap.of(), columnEquivalences, lookup, warningCollector);
+    }
+
+    /**
+     * @param changedRowsPredicates per-base row-level changed-rows predicates. A base listed here
+     *        gets a row-level delta leaf; a base absent from it keeps the partition-level leaf, which
+     *        is how one candidate mixes granularities across V3 and V2 bases.
+     */
+    public DifferentialPlanRewriter(
+            Metadata metadata,
+            Session session,
+            PlanNodeIdAllocator idAllocator,
+            VariableAllocator variableAllocator,
+            Map<SchemaTableName, List<TupleDomain<String>>> staleConstraints,
+            Map<SchemaTableName, ChangedRowsPredicate> changedRowsPredicates,
+            PassthroughColumnEquivalences columnEquivalences,
+            Lookup lookup,
+            WarningCollector warningCollector)
+    {
         this.metadata = requireNonNull(metadata, "metadata is null");
         this.session = requireNonNull(session, "session is null");
         this.idAllocator = requireNonNull(idAllocator, "idAllocator is null");
@@ -150,6 +172,7 @@ public class DifferentialPlanRewriter
         this.translator = new RowExpressionDomainTranslator(metadata);
         this.determinismEvaluator = new RowExpressionDeterminismEvaluator(metadata.getFunctionAndTypeManager());
         this.staleConstraints = ImmutableMap.copyOf(requireNonNull(staleConstraints, "staleConstraints is null"));
+        this.changedRowsPredicates = ImmutableMap.copyOf(requireNonNull(changedRowsPredicates, "changedRowsPredicates is null"));
         this.columnEquivalences = requireNonNull(columnEquivalences, "columnEquivalences is null");
         this.lookup = requireNonNull(lookup, "lookup is null");
         this.warningCollector = requireNonNull(warningCollector, "warningCollector is null");
@@ -166,6 +189,33 @@ public class DifferentialPlanRewriter
             Session session,
             MaterializedViewScanNode node,
             Map<SchemaTableName, MaterializedDataPredicates> constraints,
+            MaterializedViewDefinition materializedViewDefinition,
+            VariableAllocator variableAllocator,
+            PlanNodeIdAllocator idAllocator,
+            Lookup lookup,
+            WarningCollector warningCollector)
+    {
+        return buildStitchedPlan(metadata, session, node, constraints, ImmutableMap.of(), materializedViewDefinition, variableAllocator, idAllocator, lookup, warningCollector);
+    }
+
+    /**
+     * Builds a stitched plan whose leaves are row-level for every base the connector reports
+     * changed rows for, and partition-level for the rest.
+     *
+     * <p>Row-level identifiers are the view query's grouping keys, because Case B expansion
+     * recomputes whole affected groups and the fresh branch has to exclude exactly the storage rows
+     * for those groups. Keying the anti-join at any other grain would leave the two branches
+     * overlapping or gapped.
+     *
+     * @param changedRowsPredicates per-base row-level changed-rows predicates; empty yields the
+     *        partition-level candidate
+     */
+    public static Optional<PlanNode> buildStitchedPlan(
+            Metadata metadata,
+            Session session,
+            MaterializedViewScanNode node,
+            Map<SchemaTableName, MaterializedDataPredicates> constraints,
+            Map<SchemaTableName, ChangedRowsPredicate> changedRowsPredicates,
             MaterializedViewDefinition materializedViewDefinition,
             VariableAllocator variableAllocator,
             PlanNodeIdAllocator idAllocator,
@@ -191,6 +241,7 @@ public class DifferentialPlanRewriter
                 idAllocator,
                 variableAllocator,
                 filteredConstraints,
+                changedRowsPredicates,
                 columnEquivalences,
                 lookup,
                 warningCollector);
@@ -201,7 +252,7 @@ public class DifferentialPlanRewriter
             // The fresh branch shares the column-binding logic with the delta branch, so it has to
             // sit inside the fallback boundary too: an unstitchable plan must degrade to a full
             // recompute rather than fail the query.
-            freshPlan = buildDataTableBranch(metadata, session, node, filteredConstraints, columnEquivalences, dataTable, idAllocator, variableAllocator, lookup);
+            freshPlan = buildDataTableBranch(metadata, session, node, filteredConstraints, changedRowsPredicates, columnEquivalences, dataTable, idAllocator, variableAllocator, lookup);
             deltaResult = builder.buildDeltaPlan(node.getViewQueryPlan(), node.getViewQueryMappings());
         }
         catch (UnsupportedOperationException e) {
@@ -270,6 +321,7 @@ public class DifferentialPlanRewriter
             Session session,
             MaterializedViewScanNode node,
             Map<SchemaTableName, List<TupleDomain<String>>> constraints,
+            Map<SchemaTableName, ChangedRowsPredicate> changedRowsPredicates,
             PassthroughColumnEquivalences columnEquivalences,
             SchemaTableName dataTable,
             PlanNodeIdAllocator idAllocator,
@@ -292,6 +344,7 @@ public class DifferentialPlanRewriter
                     dataTable,
                     entry.getKey(),
                     entry.getValue(),
+                    changedRowsPredicates.get(entry.getKey()),
                     columnEquivalences,
                     node.getViewQueryPlan(),
                     idAllocator,
@@ -339,18 +392,143 @@ public class DifferentialPlanRewriter
             SchemaTableName dataTable,
             SchemaTableName baseTable,
             List<TupleDomain<String>> disjuncts,
+            ChangedRowsPredicate changedRows,
             PassthroughColumnEquivalences columnEquivalences,
             PlanNode viewQueryPlan,
             PlanNodeIdAllocator idAllocator,
             VariableAllocator variableAllocator,
             Lookup lookup)
     {
-        Map<String, VariableReferenceExpression> identifierColumns =
-                resolveIdentifierColumns(storageColumns, dataTable, baseTable, disjuncts, columnEquivalences);
+        TableScanNode baseScan = findTableScan(metadata, session, viewQueryPlan, baseTable, lookup);
+        Map<String, ColumnHandle> columnHandles = metadata.getColumnHandles(session, baseScan.getTable());
+
+        boolean rowLevel = changedRows != null && !changedRows.getDataDisjuncts().isEmpty();
+        Map<String, VariableReferenceExpression> identifierColumns = rowLevel
+                ? resolveGroupingIdentifiers(metadata, session, viewQueryPlan, storageColumns, dataTable, baseTable, columnEquivalences, lookup)
+                : resolveIdentifierColumns(storageColumns, dataTable, baseTable, disjuncts, columnEquivalences);
+        List<TupleDomain<ColumnHandle>> changedRowDisjuncts = rowLevel
+                ? changedRows.getDataDisjuncts()
+                : toHandleDisjuncts(disjuncts, columnHandles, baseTable);
 
         AffectedIdentifiers affected = buildAffectedIdentifiers(
-                metadata, session, baseTable, disjuncts, identifierColumns.keySet(), viewQueryPlan, idAllocator, variableAllocator, lookup);
+                metadata,
+                session,
+                baseScan,
+                changedRowDisjuncts,
+                resolveIdentifierHandles(identifierColumns.keySet(), columnHandles, baseTable),
+                idAllocator,
+                variableAllocator);
 
+        return antiJoin(metadata, freshPlan, identifierColumns, affected, idAllocator);
+    }
+
+    /**
+     * Row-level identifiers are the view query's grouping keys, mapped back to the base columns they
+     * read and on to the storage columns those are equivalent to.
+     *
+     * <p>Declines for shapes v1 defers: a view query with no grouping keys is row-preserving and
+     * needs the $rowId_origin storage column, and a join needs the affected groups back-joined to
+     * the other base's changed rows.
+     */
+    private static Map<String, VariableReferenceExpression> resolveGroupingIdentifiers(
+            Metadata metadata,
+            Session session,
+            PlanNode viewQueryPlan,
+            Map<TableColumn, VariableReferenceExpression> storageColumns,
+            SchemaTableName dataTable,
+            SchemaTableName baseTable,
+            PassthroughColumnEquivalences columnEquivalences,
+            Lookup lookup)
+    {
+        if (!searchFrom(viewQueryPlan, lookup).where(JoinNode.class::isInstance).findAll().isEmpty()) {
+            throw new UnsupportedOperationException("row-level refresh of a materialized view with a join is not supported yet");
+        }
+
+        AggregationNode aggregation = searchFrom(viewQueryPlan, lookup)
+                .where(AggregationNode.class::isInstance)
+                .findAll()
+                .stream()
+                .map(AggregationNode.class::cast)
+                .filter(node -> !node.getGroupingKeys().isEmpty())
+                .findFirst()
+                .orElseThrow(() -> new UnsupportedOperationException(
+                        "row-level refresh of a row-preserving materialized view requires row-origin storage, which is not implemented yet"));
+
+        Map<VariableReferenceExpression, TableColumn> baseColumnByVariable = new HashMap<>();
+        buildColumnToVariableMapping(metadata, session, viewQueryPlan, lookup).forEach((column, variable) -> {
+            if (column.getTableName().equals(baseTable)) {
+                baseColumnByVariable.putIfAbsent(variable, column);
+            }
+        });
+
+        ImmutableMap.Builder<String, VariableReferenceExpression> identifiers = ImmutableMap.builder();
+        for (VariableReferenceExpression groupingKey : aggregation.getGroupingKeys()) {
+            TableColumn baseColumn = baseColumnByVariable.get(groupingKey);
+            if (baseColumn == null) {
+                throw new UnsupportedOperationException(format(
+                        "grouping key %s is not a column of %s, so affected groups cannot be identified", groupingKey.getName(), baseTable));
+            }
+            String storageColumn = columnEquivalences.getStorageColumnName(dataTable, baseTable, baseColumn.getColumnName())
+                    .orElseThrow(() -> new UnsupportedOperationException(format(
+                            "grouping column %s has no equivalent column on the storage table", baseColumn)));
+            VariableReferenceExpression storageVariable = storageColumns.get(new TableColumn(dataTable, storageColumn));
+            if (storageVariable == null) {
+                throw new UnsupportedOperationException(format(
+                        "storage column %s.%s is not read by the data table plan", dataTable, storageColumn));
+            }
+            identifiers.put(baseColumn.getColumnName(), storageVariable);
+        }
+        return identifiers.buildKeepingLast();
+    }
+
+    /**
+     * Partition-level disjuncts arrive keyed by column name while row-level disjuncts arrive keyed by
+     * connector column handle. Everything downstream works on handles, which are unambiguous.
+     */
+    private static List<TupleDomain<ColumnHandle>> toHandleDisjuncts(
+            List<TupleDomain<String>> disjuncts,
+            Map<String, ColumnHandle> columnHandles,
+            SchemaTableName baseTable)
+    {
+        ImmutableList.Builder<TupleDomain<ColumnHandle>> result = ImmutableList.builder();
+        for (TupleDomain<String> disjunct : disjuncts) {
+            for (String column : disjunct.getDomains().orElse(ImmutableMap.of()).keySet()) {
+                if (!columnHandles.containsKey(column)) {
+                    throw new UnsupportedOperationException(format("base table %s does not expose column %s", baseTable, column));
+                }
+            }
+            result.add(disjunct.transform(columnHandles::get));
+        }
+        return result.build();
+    }
+
+    private static Map<String, ColumnHandle> resolveIdentifierHandles(
+            Set<String> identifierColumns,
+            Map<String, ColumnHandle> columnHandles,
+            SchemaTableName baseTable)
+    {
+        ImmutableMap.Builder<String, ColumnHandle> handles = ImmutableMap.builder();
+        for (String column : identifierColumns) {
+            ColumnHandle handle = columnHandles.get(column);
+            if (handle == null) {
+                throw new UnsupportedOperationException(format("base table %s does not expose column %s", baseTable, column));
+            }
+            handles.put(column, handle);
+        }
+        return handles.build();
+    }
+
+    /**
+     * Emits {@code ANTI JOIN(freshPlan, affected_identifiers)}, keyed on the storage column each
+     * identifier is equivalent to.
+     */
+    private static PlanNode antiJoin(
+            Metadata metadata,
+            PlanNode freshPlan,
+            Map<String, VariableReferenceExpression> identifierColumns,
+            AffectedIdentifiers affected,
+            PlanNodeIdAllocator idAllocator)
+    {
         // Equi-join criteria treat null as unequal, so a null identifier would leave the stale
         // storage row in the fresh branch while the delta branch also recomputes it. Matching on
         // NOT(IS DISTINCT FROM) keeps a null identifier joinable, which matters because a null
@@ -407,87 +585,74 @@ public class DifferentialPlanRewriter
 
     /**
      * {@code affected_identifiers(base, identifier_columns) = DISTINCT(from_current_base)}, where
-     * {@code from_current_base} scans the base table, keeps the rows the stale disjuncts select, and
-     * projects the identifier columns.
+     * {@code from_current_base} scans the base table, keeps the rows the changed-rows disjuncts
+     * select, and projects the identifier columns.
+     *
+     * <p>The disjuncts are the partition-level stale predicates for a partition-level candidate and
+     * the connector's row-level changed-rows predicates for a row-level one; the construction is
+     * identical either way, which is the point of the shared helper.
      */
     private static AffectedIdentifiers buildAffectedIdentifiers(
             Metadata metadata,
             Session session,
-            SchemaTableName baseTable,
-            List<TupleDomain<String>> disjuncts,
-            Set<String> identifierColumns,
-            PlanNode viewQueryPlan,
+            TableScanNode baseScan,
+            List<TupleDomain<ColumnHandle>> disjuncts,
+            Map<String, ColumnHandle> identifierColumns,
             PlanNodeIdAllocator idAllocator,
-            VariableAllocator variableAllocator,
-            Lookup lookup)
+            VariableAllocator variableAllocator)
     {
-        TableScanNode baseScan = findTableScan(metadata, session, viewQueryPlan, baseTable, lookup);
-        Map<String, ColumnHandle> columnHandles = metadata.getColumnHandles(session, baseScan.getTable());
-
-        // The predicate can constrain columns the identifier set does not include, so the scan reads
-        // the union and the projection narrows to the identifiers afterwards.
-        Set<String> scannedColumns = ImmutableSet.<String>builder()
-                .addAll(identifierColumns)
-                .addAll(disjuncts.stream()
-                        .flatMap(disjunct -> disjunct.getDomains().orElse(ImmutableMap.of()).keySet().stream())
-                        .collect(toImmutableSet()))
-                .build();
-
-        ImmutableList.Builder<VariableReferenceExpression> outputs = ImmutableList.builder();
-        ImmutableMap.Builder<VariableReferenceExpression, ColumnHandle> assignments = ImmutableMap.builder();
-        ImmutableMap.Builder<String, VariableReferenceExpression> variablesByColumn = ImmutableMap.builder();
-        for (String columnName : scannedColumns) {
-            ColumnHandle columnHandle = columnHandles.get(columnName);
-            if (columnHandle == null) {
-                throw new UnsupportedOperationException(format("base table %s does not expose column %s", baseTable, columnName));
-            }
-            VariableReferenceExpression variable = variableAllocator.newVariable(
-                    columnName,
-                    metadata.getColumnMetadata(session, baseScan.getTable(), columnHandle).getType());
-            outputs.add(variable);
-            assignments.put(variable, columnHandle);
-            variablesByColumn.put(columnName, variable);
+        // The predicate can constrain columns the identifier set does not include -- a row-level
+        // predicate is expressed entirely over change-tracking columns -- so the scan reads the
+        // union and the DISTINCT narrows to the identifiers afterwards.
+        Map<ColumnHandle, VariableReferenceExpression> variablesByHandle = new LinkedHashMap<>();
+        for (ColumnHandle handle : identifierColumns.values()) {
+            allocateScanVariable(metadata, session, baseScan, handle, variablesByHandle, variableAllocator);
         }
-        Map<String, VariableReferenceExpression> variables = variablesByColumn.build();
+        for (TupleDomain<ColumnHandle> disjunct : disjuncts) {
+            for (ColumnHandle handle : disjunct.getDomains().orElse(ImmutableMap.of()).keySet()) {
+                allocateScanVariable(metadata, session, baseScan, handle, variablesByHandle, variableAllocator);
+            }
+        }
 
         TableScanNode scan = new TableScanNode(
                 baseScan.getSourceLocation(),
                 idAllocator.getNextId(),
                 baseScan.getTable(),
-                outputs.build(),
-                assignments.build(),
+                ImmutableList.copyOf(variablesByHandle.values()),
+                ImmutableMap.copyOf(variablesByHandle).entrySet().stream()
+                        .collect(toImmutableMap(Map.Entry::getValue, Map.Entry::getKey)),
                 baseScan.getTableConstraints(),
                 TupleDomain.all(),
                 TupleDomain.all(),
                 Optional.empty());
 
         RowExpressionDomainTranslator translator = new RowExpressionDomainTranslator(metadata);
-        ImmutableList.Builder<RowExpression> staleExpressions = ImmutableList.builder();
-        for (TupleDomain<String> disjunct : disjuncts) {
-            TupleDomain<VariableReferenceExpression> bound = disjunct.transform(variables::get);
+        ImmutableList.Builder<RowExpression> changedExpressions = ImmutableList.builder();
+        for (TupleDomain<ColumnHandle> disjunct : disjuncts) {
+            TupleDomain<VariableReferenceExpression> bound = disjunct.transform(variablesByHandle::get);
             if (bound.isAll()) {
                 throw new UnsupportedOperationException(format(
-                        "stale predicate for %s is not expressible over the scanned columns", baseTable));
+                        "changed-rows predicate for %s is not expressible over the scanned columns",
+                        metadata.getTableMetadata(session, baseScan.getTable()).getTable()));
             }
-            staleExpressions.add(translator.toPredicate(bound));
+            changedExpressions.add(translator.toPredicate(bound));
         }
 
         FilterNode changedRows = new FilterNode(
                 baseScan.getSourceLocation(),
                 idAllocator.getNextId(),
                 scan,
-                or(staleExpressions.build()));
+                or(changedExpressions.build()));
 
-        List<VariableReferenceExpression> identifierVariables = identifierColumns.stream()
-                .map(variables::get)
-                .collect(toImmutableList());
+        Map<String, VariableReferenceExpression> identifierVariables = identifierColumns.entrySet().stream()
+                .collect(toImmutableMap(Map.Entry::getKey, entry -> variablesByHandle.get(entry.getValue())));
 
         AggregationNode distinctIdentifiers = new AggregationNode(
                 baseScan.getSourceLocation(),
                 idAllocator.getNextId(),
                 changedRows,
                 ImmutableMap.of(),
-                new AggregationNode.GroupingSetDescriptor(identifierVariables, 1, ImmutableSet.of()),
+                new AggregationNode.GroupingSetDescriptor(ImmutableList.copyOf(identifierVariables.values()), 1, ImmutableSet.of()),
                 ImmutableList.of(),
                 SINGLE,
                 Optional.empty(),
@@ -496,7 +661,7 @@ public class DifferentialPlanRewriter
 
         VariableReferenceExpression marker = variableAllocator.newVariable("affected", BooleanType.BOOLEAN);
         Assignments.Builder markerAssignments = Assignments.builder();
-        identifierVariables.forEach(variable -> markerAssignments.put(variable, variable));
+        identifierVariables.values().forEach(variable -> markerAssignments.put(variable, variable));
         markerAssignments.put(marker, TRUE_CONSTANT);
 
         ProjectNode withMarker = new ProjectNode(
@@ -506,7 +671,21 @@ public class DifferentialPlanRewriter
                 markerAssignments.build(),
                 ProjectNode.Locality.LOCAL);
 
-        return new AffectedIdentifiers(withMarker, identifierColumns.stream().collect(toImmutableMap(identity(), variables::get)), marker);
+        return new AffectedIdentifiers(withMarker, identifierVariables, marker);
+    }
+
+    private static void allocateScanVariable(
+            Metadata metadata,
+            Session session,
+            TableScanNode baseScan,
+            ColumnHandle handle,
+            Map<ColumnHandle, VariableReferenceExpression> variablesByHandle,
+            VariableAllocator variableAllocator)
+    {
+        variablesByHandle.computeIfAbsent(handle, column -> {
+            ColumnMetadata columnMetadata = metadata.getColumnMetadata(session, baseScan.getTable(), column);
+            return variableAllocator.newVariable(columnMetadata.getName(), columnMetadata.getType());
+        });
     }
 
     private static TableScanNode findTableScan(
@@ -715,6 +894,21 @@ public class DifferentialPlanRewriter
         public PlanVariants visitTableScan(TableScanNode node, Void context)
         {
             SchemaTableName tableName = metadata.getTableMetadata(session, node.getTable()).getTable();
+
+            ChangedRowsPredicate changedRows = changedRowsPredicates.get(tableName);
+            if (changedRows != null && !changedRows.getDataDisjuncts().isEmpty()) {
+                return rowLevelTableScan(node, tableName, changedRows);
+            }
+            return partitionLevelTableScan(node, tableName);
+        }
+
+        /**
+         * The partition-level leaf: the delta is the base rows in a stale partition, and the stale
+         * boundary is expressed over the partition columns, so the closure records them and an
+         * aggregation above can take Case A when they cover its grouping keys.
+         */
+        private PlanVariants partitionLevelTableScan(TableScanNode node, SchemaTableName tableName)
+        {
             List<TupleDomain<String>> stalePredicates = staleConstraints.getOrDefault(tableName, ImmutableList.of());
 
             // Build three table scan variants with fresh variables
@@ -738,6 +932,93 @@ public class DifferentialPlanRewriter
                             .flatMap(predicate -> predicate.getDomains().orElse(ImmutableMap.of()).keySet().stream())
                             .map(column -> new TableColumn(tableName, column))
                             .collect(toImmutableSet())));
+        }
+
+        /**
+         * The row-level leaf: the delta is the base rows the connector reports as changed. The
+         * predicate is expressed over change-tracking columns the view query does not project, so
+         * each variant re-reads the table with those columns added and projects them away again,
+         * leaving the schema the parent operators expect.
+         *
+         * <p>The closure is None because a row-level boundary says nothing about any grouping key.
+         * That is what forces an aggregation above into Case B expansion, which is correct for any
+         * aggregation function.
+         */
+        private PlanVariants rowLevelTableScan(TableScanNode node, SchemaTableName tableName, ChangedRowsPredicate changedRows)
+        {
+            Set<ColumnHandle> predicateColumns = changedRows.getDataDisjuncts().stream()
+                    .flatMap(disjunct -> disjunct.getDomains().orElse(ImmutableMap.of()).keySet().stream())
+                    .collect(toImmutableSet());
+
+            RowLevelScan delta = buildRowLevelScan(node, predicateColumns);
+            RowLevelScan unchanged = buildRowLevelScan(node, predicateColumns);
+            NodeWithMapping current = buildTableScan(node, node.getOutputVariables());
+
+            RowExpression changedPredicate = buildChangedRowsPredicate(tableName, changedRows, delta);
+            RowExpression unchangedPredicate = not(metadata.getFunctionAndTypeManager(),
+                    buildChangedRowsPredicate(tableName, changedRows, unchanged));
+
+            return new PlanVariants(
+                    delta.filterAndRestore(node, changedPredicate),
+                    current,
+                    unchanged.filterAndRestore(node, unchangedPredicate),
+                    Optional.empty());
+        }
+
+        private RowExpression buildChangedRowsPredicate(SchemaTableName tableName, ChangedRowsPredicate changedRows, RowLevelScan scan)
+        {
+            ImmutableList.Builder<RowExpression> disjuncts = ImmutableList.builder();
+            for (TupleDomain<ColumnHandle> disjunct : changedRows.getDataDisjuncts()) {
+                TupleDomain<VariableReferenceExpression> bound = disjunct.transform(scan::variableFor);
+                if (bound.isAll()) {
+                    throw new UnsupportedOperationException(format(
+                            "changed-rows predicate for %s is not expressible over the scanned columns", tableName));
+                }
+                disjuncts.add(translator.toPredicate(bound));
+            }
+            return or(disjuncts.build());
+        }
+
+        /**
+         * Rebuilds a scan with extra columns appended, remembering both the mapping the parent
+         * operators use and the variable each extra column landed on.
+         */
+        private RowLevelScan buildRowLevelScan(TableScanNode original, Set<ColumnHandle> extraColumns)
+        {
+            Map<VariableReferenceExpression, VariableReferenceExpression> mapping = createFreshMapping(original.getOutputVariables());
+            TableScanNode remapped = new SymbolMapper(mapping, warningCollector).map(original, idAllocator.getNextId());
+
+            Map<ColumnHandle, VariableReferenceExpression> alreadyRead = new HashMap<>();
+            remapped.getAssignments().forEach((variable, handle) -> alreadyRead.putIfAbsent(handle, variable));
+
+            List<VariableReferenceExpression> outputs = new ArrayList<>(remapped.getOutputVariables());
+            Map<VariableReferenceExpression, ColumnHandle> assignments = new HashMap<>(remapped.getAssignments());
+            ImmutableMap.Builder<ColumnHandle, VariableReferenceExpression> extras = ImmutableMap.builder();
+            for (ColumnHandle handle : extraColumns) {
+                VariableReferenceExpression present = alreadyRead.get(handle);
+                if (present != null) {
+                    extras.put(handle, present);
+                    continue;
+                }
+                ColumnMetadata columnMetadata = metadata.getColumnMetadata(session, original.getTable(), handle);
+                VariableReferenceExpression variable = variableAllocator.newVariable(columnMetadata.getName(), columnMetadata.getType());
+                outputs.add(variable);
+                assignments.put(variable, handle);
+                extras.put(handle, variable);
+            }
+
+            TableScanNode scan = new TableScanNode(
+                    remapped.getSourceLocation(),
+                    idAllocator.getNextId(),
+                    remapped.getTable(),
+                    ImmutableList.copyOf(outputs),
+                    ImmutableMap.copyOf(assignments),
+                    remapped.getTableConstraints(),
+                    remapped.getCurrentConstraint(),
+                    remapped.getEnforcedConstraint(),
+                    remapped.getCteMaterializationInfo());
+
+            return new RowLevelScan(scan, mapping, extras.build());
         }
 
         private NodeWithMapping buildTableScan(TableScanNode original, List<VariableReferenceExpression> variables)
@@ -1481,6 +1762,55 @@ public class DifferentialPlanRewriter
                         "GroupReference should have been resolved by DeltaBuilder before cloning. " +
                         "This indicates the plan was not fully resolved before SubtreeRemappingVisitor was invoked.");
             }
+        }
+    }
+
+    /**
+     * A base scan re-read with extra change-tracking columns appended, so a predicate over columns
+     * the view query does not project can still be applied at the leaf.
+     */
+    private class RowLevelScan
+    {
+        private final TableScanNode scan;
+        private final Map<VariableReferenceExpression, VariableReferenceExpression> mapping;
+        private final Map<ColumnHandle, VariableReferenceExpression> extraColumns;
+
+        RowLevelScan(
+                TableScanNode scan,
+                Map<VariableReferenceExpression, VariableReferenceExpression> mapping,
+                Map<ColumnHandle, VariableReferenceExpression> extraColumns)
+        {
+            this.scan = requireNonNull(scan, "scan is null");
+            this.mapping = ImmutableMap.copyOf(requireNonNull(mapping, "mapping is null"));
+            this.extraColumns = ImmutableMap.copyOf(requireNonNull(extraColumns, "extraColumns is null"));
+        }
+
+        VariableReferenceExpression variableFor(ColumnHandle column)
+        {
+            return extraColumns.get(column);
+        }
+
+        /**
+         * Applies the predicate and projects back to the columns the view query scan produced, so
+         * the appended change-tracking columns do not leak into the parent operators.
+         */
+        NodeWithMapping filterAndRestore(TableScanNode original, RowExpression predicate)
+        {
+            FilterNode filtered = new FilterNode(scan.getSourceLocation(), idAllocator.getNextId(), scan, predicate);
+            List<VariableReferenceExpression> restored = original.getOutputVariables().stream()
+                    .map(mapping::get)
+                    .collect(toImmutableList());
+            if (restored.equals(scan.getOutputVariables())) {
+                return new NodeWithMapping(filtered, mapping);
+            }
+            return new NodeWithMapping(
+                    new ProjectNode(
+                            scan.getSourceLocation(),
+                            idAllocator.getNextId(),
+                            filtered,
+                            identityAssignments(restored),
+                            ProjectNode.Locality.LOCAL),
+                    mapping);
         }
     }
 
