@@ -260,8 +260,11 @@ public class FeaturesConfig
     private MaterializedViewRefreshType materializedViewDefaultRefreshType = MaterializedViewRefreshType.FULL;
     private MaterializedViewStaleReadBehavior materializedViewStaleReadBehavior = MaterializedViewStaleReadBehavior.USE_VIEW_QUERY;
     private MaterializedViewRewriteStrategy materializedViewStitchingStrategy = MaterializedViewRewriteStrategy.ALWAYS;
-    // Row-level refresh defaults to AUTOMATIC so it only fires where the cost picker finds it cheaper.
-    private MaterializedViewRewriteStrategy materializedViewRowLevelIncrementalStrategy = MaterializedViewRewriteStrategy.AUTOMATIC;
+    // The handover specifies AUTOMATIC, but affected_identifiers is still built only from
+    // from_current_base. Without from_changeset_deletes a group whose rows were all deleted has
+    // nothing left to identify it, so the fresh branch would keep its stale rows. Defaults to NEVER
+    // until that half lands; AUTOMATIC is then the intended default.
+    private MaterializedViewRewriteStrategy materializedViewRowLevelIncrementalStrategy = MaterializedViewRewriteStrategy.NEVER;
     private MaterializedViewRewriteStrategy materializedViewIncrementalRefreshStrategy = MaterializedViewRewriteStrategy.ALWAYS;
 
     private AggregationIfToFilterRewriteStrategy aggregationIfToFilterRewriteStrategy = AggregationIfToFilterRewriteStrategy.DISABLED;

@@ -46,7 +46,6 @@ import com.facebook.presto.spi.plan.SortNode;
 import com.facebook.presto.spi.plan.TableScanNode;
 import com.facebook.presto.spi.plan.TopNNode;
 import com.facebook.presto.spi.plan.UnionNode;
-import com.facebook.presto.spi.relation.SpecialFormExpression;
 import com.facebook.presto.spi.relation.VariableReferenceExpression;
 import com.facebook.presto.sql.planner.iterative.Lookup;
 import com.facebook.presto.testing.LocalQueryRunner;
@@ -517,10 +516,10 @@ public class TestDifferentialPlanRewriter
     }
 
     @Test
-    public void testFreshBranchAntiJoinsAffectedIdentifiers()
+    public void testPartitionLevelFreshBranchFiltersStorageColumns()
     {
-        // customer stands in for the MV storage table and orders for the single stale base. custkey
-        // is the identifier: it exists on both, with the same type, so it can key the anti-join.
+        // A partition-level stale predicate maps to the storage table's own columns, so the fresh
+        // branch excludes affected rows with a filter the connector can prune partitions from.
         TableScanNode storage = createCustomerTableScan();
         TableScanNode base = createOrdersTableScanWithCustkey();
 
@@ -530,30 +529,17 @@ public class TestDifferentialPlanRewriter
         assertTrue(stitched.isPresent(), "expected a stitched plan");
         UnionNode union = (UnionNode) stitched.get();
 
-        // fresh branch: project -> filter(marker IS NULL) -> LEFT join
-        ProjectNode freshProject = (ProjectNode) union.getSources().get(0);
-        FilterNode unmatched = (FilterNode) freshProject.getSource();
-        assertTrue(unmatched.getPredicate() instanceof SpecialFormExpression
-                        && ((SpecialFormExpression) unmatched.getPredicate()).getForm() == SpecialFormExpression.Form.IS_NULL,
-                "fresh branch keeps the rows that did not match affected_identifiers, got: " + unmatched.getPredicate());
+        FilterNode fresh = (FilterNode) union.getSources().get(0);
+        assertEquals(fresh.getSource(), storage, "the filter applies directly to the storage scan");
+        assertTrue(fresh.getPredicate().toString().contains("custkey"),
+                "the fresh branch is excluded by the storage column the stale column maps to, got: " + fresh.getPredicate());
 
-        JoinNode antiJoin = (JoinNode) unmatched.getSource();
-        assertEquals(antiJoin.getType(), LEFT, "anti-join must preserve unmatched storage rows");
-        assertTrue(antiJoin.getCriteria().isEmpty(), "identifiers are matched null-safely, not by equi-criteria");
-        assertTrue(antiJoin.getFilter().isPresent(), "anti-join must carry the null-safe match predicate");
-        assertTrue(antiJoin.getFilter().get().toString().contains("IS_DISTINCT_FROM"),
-                "a null identifier is a group of its own and must still match, got: " + antiJoin.getFilter().get());
-        assertEquals(antiJoin.getLeft(), storage, "the storage table is the preserved side");
-
-        // affected_identifiers: project(marker) -> distinct -> filter -> scan of the stale base
-        ProjectNode marked = (ProjectNode) antiJoin.getRight();
-        AggregationNode distinct = (AggregationNode) marked.getSource();
-        assertTrue(distinct.getAggregations().isEmpty(), "affected_identifiers is a DISTINCT, not an aggregation");
-        assertEquals(distinct.getGroupingKeys().size(), 1, "one identifier column");
-        FilterNode changedRows = (FilterNode) distinct.getSource();
-        TableScanNode affectedScan = (TableScanNode) changedRows.getSource();
-        assertEquals(metadata.getTableMetadata(session, affectedScan.getTable()).getTable(), ORDERS_TABLE,
-                "affected_identifiers reads the stale base table");
+        // The correctness property this shape carries: excluding by predicate does not depend on a
+        // base row surviving to identify the partition. An anti-join against the base would leave
+        // the stale storage rows of a fully deleted partition in the fresh branch, because nothing
+        // would be left to match them against.
+        assertTrue(searchFrom(union.getSources().get(0), lookup).where(JoinNode.class::isInstance).findAll().isEmpty(),
+                "the partition-level fresh branch must not depend on scanning the base table");
     }
 
     @Test

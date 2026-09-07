@@ -308,13 +308,22 @@ public class DifferentialPlanRewriter
     /**
      * Builds the fresh branch: the MV storage rows that do not need recomputing.
      *
-     * <p>The branch anti-joins the storage table against an {@code affected_identifiers} relation
-     * per stale base table, rather than filtering on a negated stale predicate. The two are
-     * equivalent for partition-level staleness, but the anti-join is the shape row-level refresh
-     * also needs, because a row-level predicate is expressed over a change-tracking column that has
-     * no equivalent on the storage table and so cannot become a filter on storage columns.
+     * <p>Two mechanisms, chosen per base table, because they are not interchangeable:
      *
-     * <p>A row is excluded when it is affected by <em>any</em> stale base, so the anti-joins chain.
+     * <ul>
+     *   <li>A partition-level stale predicate maps to the storage table's own columns, so the
+     *       branch excludes affected rows with {@code Filter(NOT stale_predicate)}. The connector
+     *       can prune partitions from that predicate, and it stays correct when a partition's rows
+     *       are all deleted -- the predicate still names the partition even though no base row
+     *       survives to identify it.</li>
+     *   <li>A row-level changed-rows predicate is expressed over change-tracking columns that have
+     *       no equivalent on the storage table, so it cannot become a filter there. The branch
+     *       anti-joins against the {@code affected_identifiers} relation instead.</li>
+     * </ul>
+     *
+     * <p>Exactly one mechanism applies per base: applying both would exclude more from the fresh
+     * branch than the delta branch recomputes, dropping rows. A row is excluded when any base made
+     * it stale, so the mechanisms compose across bases.
      */
     private static PlanNode buildDataTableBranch(
             Metadata metadata,
@@ -332,8 +341,20 @@ public class DifferentialPlanRewriter
         Map<TableColumn, VariableReferenceExpression> storageColumns =
                 buildColumnToVariableMapping(metadata, session, freshPlan, lookup);
 
+        ImmutableList.Builder<TupleDomain<String>> storagePredicates = ImmutableList.builder();
         for (Map.Entry<SchemaTableName, List<TupleDomain<String>>> entry : constraints.entrySet()) {
-            if (entry.getValue().isEmpty()) {
+            SchemaTableName baseTable = entry.getKey();
+            if (entry.getValue().isEmpty() || isRowLevel(changedRowsPredicates.get(baseTable))) {
+                continue;
+            }
+            storagePredicates.addAll(equivalentDataTablePredicates(entry.getValue(), baseTable, columnEquivalences, dataTable));
+        }
+        freshPlan = filterOutStaleRows(metadata, freshPlan, storagePredicates.build(), storageColumns, dataTable, idAllocator);
+
+        for (Map.Entry<SchemaTableName, List<TupleDomain<String>>> entry : constraints.entrySet()) {
+            SchemaTableName baseTable = entry.getKey();
+            ChangedRowsPredicate changedRows = changedRowsPredicates.get(baseTable);
+            if (!isRowLevel(changedRows)) {
                 continue;
             }
             freshPlan = antiJoinAffectedIdentifiers(
@@ -342,9 +363,9 @@ public class DifferentialPlanRewriter
                     freshPlan,
                     storageColumns,
                     dataTable,
-                    entry.getKey(),
+                    baseTable,
                     entry.getValue(),
-                    changedRowsPredicates.get(entry.getKey()),
+                    changedRows,
                     columnEquivalences,
                     node.getViewQueryPlan(),
                     idAllocator,
@@ -352,6 +373,65 @@ public class DifferentialPlanRewriter
                     lookup);
         }
         return freshPlan;
+    }
+
+    private static boolean isRowLevel(ChangedRowsPredicate changedRows)
+    {
+        return changedRows != null && !changedRows.getDataDisjuncts().isEmpty();
+    }
+
+    /**
+     * Rewrites a base table's stale disjuncts onto the equivalent storage table columns.
+     */
+    private static List<TupleDomain<String>> equivalentDataTablePredicates(
+            List<TupleDomain<String>> disjuncts,
+            SchemaTableName baseTable,
+            PassthroughColumnEquivalences columnEquivalences,
+            SchemaTableName dataTable)
+    {
+        ImmutableList.Builder<TupleDomain<String>> result = ImmutableList.builder();
+        for (TupleDomain<String> disjunct : disjuncts) {
+            TupleDomain<String> dataTablePredicate = columnEquivalences.getEquivalentPredicates(baseTable, disjunct).get(dataTable);
+            if (dataTablePredicate == null || dataTablePredicate.isAll()) {
+                throw new UnsupportedOperationException(format(
+                        "stale predicate for %s has no equivalent over the storage table's columns", baseTable));
+            }
+            result.add(dataTablePredicate);
+        }
+        return result.build();
+    }
+
+    private static PlanNode filterOutStaleRows(
+            Metadata metadata,
+            PlanNode freshPlan,
+            List<TupleDomain<String>> stalePredicates,
+            Map<TableColumn, VariableReferenceExpression> storageColumns,
+            SchemaTableName dataTable,
+            PlanNodeIdAllocator idAllocator)
+    {
+        if (stalePredicates.isEmpty()) {
+            return freshPlan;
+        }
+
+        RowExpressionDomainTranslator translator = new RowExpressionDomainTranslator(metadata);
+        ImmutableList.Builder<RowExpression> staleExpressions = ImmutableList.builder();
+        for (TupleDomain<String> predicate : stalePredicates) {
+            TupleDomain<VariableReferenceExpression> bound =
+                    predicate.transform(column -> storageColumns.get(new TableColumn(dataTable, column)));
+            // An unbound predicate widens to all(), which would negate to FALSE and empty the fresh
+            // branch. Decline instead of silently dropping every fresh row.
+            if (bound.isAll()) {
+                throw new UnsupportedOperationException(format(
+                        "stale predicate is not expressible over the columns %s reads", dataTable));
+            }
+            staleExpressions.add(translator.toPredicate(bound));
+        }
+
+        return new FilterNode(
+                freshPlan.getSourceLocation(),
+                idAllocator.getNextId(),
+                freshPlan,
+                not(metadata.getFunctionAndTypeManager(), or(staleExpressions.build())));
     }
 
     /**
