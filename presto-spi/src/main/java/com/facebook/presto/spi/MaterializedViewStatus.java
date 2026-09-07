@@ -150,6 +150,13 @@ public class MaterializedViewStatus
         return materializedViewState == PARTIALLY_MATERIALIZED;
     }
 
+    /**
+     * @deprecated superseded by {@link #getChangedRowsPredicates()}, whose disjuncts express
+     *         partition-level and row-level staleness in one form. Still the only mechanism for a
+     *         base table without row lineage, and still the input to partition-level stitching, so
+     *         it cannot be removed until every connector reports changed rows.
+     */
+    @Deprecated
     public Map<SchemaTableName, MaterializedDataPredicates> getPartitionsFromBaseTables()
     {
         return partitionsFromBaseTables;

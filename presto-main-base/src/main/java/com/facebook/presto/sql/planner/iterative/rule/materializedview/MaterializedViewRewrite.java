@@ -46,10 +46,12 @@ import com.facebook.presto.spi.security.ViewExpression;
 import com.facebook.presto.spi.security.ViewSecurity;
 import com.facebook.presto.sql.planner.iterative.Rule;
 import com.google.common.collect.ImmutableList;
+import com.google.common.collect.Sets;
 
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 
 import static com.facebook.presto.SystemSessionProperties.getMaterializedViewRowLevelIncrementalStrategy;
 import static com.facebook.presto.SystemSessionProperties.getMaterializedViewStaleReadBehavior;
@@ -219,6 +221,22 @@ public class MaterializedViewRewrite
             return Optional.empty();
         }
         if (getMaterializedViewRowLevelIncrementalStrategy(session) == MaterializedViewRewriteStrategy.NEVER) {
+            return Optional.empty();
+        }
+
+        // The SPI pairing contract: a connector reporting changed rows for a base table must also
+        // pin a handle at that base's recorded version, because the change set is only defined over
+        // (recorded, pinned]. A connector that populated one and not the other has told the engine
+        // something it cannot act on, so decline rather than plan against half the contract.
+        Set<SchemaTableName> unpinnedBases = Sets.difference(
+                status.getChangedRowsPredicates().keySet(),
+                status.getRecordedBaseTableHandles().keySet());
+        if (!unpinnedBases.isEmpty()) {
+            context.getWarningCollector().add(new PrestoWarning(
+                    MATERIALIZED_VIEW_STITCHING_FALLBACK,
+                    "Cannot use row-level stitching for materialized view " + node.getMaterializedViewName() +
+                            ": the connector reported changed rows for " + unpinnedBases +
+                            " without a handle pinned at the recorded version."));
             return Optional.empty();
         }
 

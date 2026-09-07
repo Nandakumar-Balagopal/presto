@@ -849,6 +849,12 @@ public interface ConnectorMetadata
 
     /**
      * Returns the version embedded in a table handle when the connector supports row-level change tracking.
+     *
+     * <p>A non-empty return is the connector's declaration that it tracks row-level change. The
+     * version is opaque to the engine, which only round-trips it through materialized view metadata
+     * and hands it back as the {@code from} or {@code to} bound of {@link #getChangeSet}.
+     *
+     * <p>See {@link #getChangeSet} for the obligations that come with declaring the capability.
      */
     default Optional<ConnectorTableVersion> getCurrentTableVersion(ConnectorSession session, ConnectorTableHandle table)
     {
@@ -857,6 +863,23 @@ public interface ConnectorMetadata
 
     /**
      * Returns changes between two table versions. Connectors must return pre-change values for DELETE and UPDATE_BEFORE rows.
+     *
+     * <p>Implementing this method without throwing commits the connector to the whole of row-level
+     * change tracking, because the engine cannot build a correct plan from a subset of it. A
+     * connector that overrides this method MUST also:
+     *
+     * <ul>
+     *   <li>return non-empty from {@link #getCurrentTableVersion} for the same table, since the
+     *       change set is only meaningful over a version range the engine can name;</li>
+     *   <li>populate {@code MaterializedViewStatus.recordedBaseTableHandles} with a handle pinned at
+     *       the recorded version of every base table of a materialized view, which is where the
+     *       {@code from} bound comes from; and</li>
+     *   <li>populate {@code MaterializedViewStatus.changedRowsPredicates} for those same base
+     *       tables, so the engine can identify changed rows without reading the change set.</li>
+     * </ul>
+     *
+     * <p>The engine declines row-level refresh rather than risking a wrong answer when it finds the
+     * predicates populated without the matching pinned handles.
      */
     default ChangeKindPageSource getChangeSet(
             ConnectorSession session,
