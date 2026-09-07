@@ -129,9 +129,9 @@ public class Changes
         long fromVersion = requireBigintArgument(arguments, FROM_ARGUMENT);
         long toVersion = requireBigintArgument(arguments, TO_ARGUMENT);
         boolean includeRowId = requireBooleanArgument(arguments, INCLUDE_ROW_ID_ARGUMENT);
-        if (fromVersion > toVersion) {
-            throw new PrestoException(INVALID_FUNCTION_ARGUMENT, "FROM_VERSION must not be greater than TO_VERSION");
-        }
+        // Version values are opaque to the engine: an Iceberg snapshot id, for instance, is a random
+        // 64-bit value with no ordering relationship to its ancestors. Only the connector can decide
+        // whether the range is valid, which it does by checking that `to` descends from `from`.
 
         Session engineSession = SystemConnectorSessionUtil.toSession(transaction, session);
         TableHandle tableHandle;
