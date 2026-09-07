@@ -535,7 +535,15 @@ public interface Metadata
      */
     MaterializedViewStatus getMaterializedViewStatus(Session session, QualifiedObjectName viewName, TupleDomain<String> baseQueryDomain);
 
-    boolean supportsMaterializedViewRowLevelRefresh(Session session, TableHandle materializedViewTable);
+    /**
+     * Whether the materialized view's storage table can atomically replace the affected rows of a
+     * refresh. Connectors opt in; the default keeps row-level refresh off so that a connector which
+     * has not implemented the atomic delete-plus-insert commit falls back to partition-level refresh.
+     */
+    default boolean supportsMaterializedViewRowLevelRefresh(Session session, TableHandle materializedViewTable)
+    {
+        return false;
+    }
 
     /**
      * Try to locate a table index that can lookup results by indexableColumns and provide the requested outputColumns.
