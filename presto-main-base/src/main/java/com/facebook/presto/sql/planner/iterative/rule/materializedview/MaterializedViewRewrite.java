@@ -48,6 +48,7 @@ import com.facebook.presto.sql.planner.iterative.Rule;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.Sets;
 
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -73,6 +74,7 @@ import static com.google.common.base.Preconditions.checkState;
 import static com.google.common.collect.ImmutableList.toImmutableList;
 import static java.lang.System.currentTimeMillis;
 import static java.util.Objects.requireNonNull;
+import static java.util.stream.Collectors.joining;
 
 /**
  * Rewrites {@link MaterializedViewScanNode} to use pre-computed data when possible.
@@ -143,20 +145,26 @@ public class MaterializedViewRewrite
                     "Stitching disabled for materialized view " + node.getMaterializedViewName() +
                             " (materialized_view_stitching_strategy=NEVER); falling back to full view query."));
         }
-        if (!status.isFullyMaterialized() && !status.getPartitionsFromBaseTables().isEmpty()) {
+        if (!status.isFullyMaterialized()) {
             Map<SchemaTableName, MaterializedDataPredicates> constraints = status.getPartitionsFromBaseTables();
 
             if (shouldStitch && !stitchingDisabledByStrategy && canUseDataTableWithSecurityChecks(node, metadataResolver, session, definition, context)) {
-                Optional<PlanNode> unionPlan = buildStitchedPlan(
-                        metadata,
-                        session,
-                        node,
-                        constraints,
-                        definition,
-                        variableAllocator,
-                        idAllocator,
-                        context.getLookup(),
-                        context.getWarningCollector());
+                // Partition-level needs partition metadata; row-level does not, and is built from the
+                // connector's changed-rows predicates instead. Building the partition-level candidate
+                // from an empty constraint set would produce an empty delta and so a silently stale
+                // answer, so it is only attempted when there is something to constrain it with.
+                Optional<PlanNode> unionPlan = constraints.isEmpty()
+                        ? Optional.empty()
+                        : buildStitchedPlan(
+                                metadata,
+                                session,
+                                node,
+                                constraints,
+                                definition,
+                                variableAllocator,
+                                idAllocator,
+                                context.getLookup(),
+                                context.getWarningCollector());
 
                 Optional<PlanNode> rowLevelPlan = buildRowLevelPlan(
                         session, node, status, constraints, definition, variableAllocator, idAllocator, context, unionPlan.isPresent());
@@ -173,6 +181,13 @@ public class MaterializedViewRewrite
                         return Result.ofPlanNode(buildAutomaticCandidates(node, candidates, idAllocator));
                     }
                     return Result.ofPlanNode(candidates.get(0));
+                }
+                if (constraints.isEmpty() && !status.hasRowLevelChanges()) {
+                    context.getWarningCollector().add(new PrestoWarning(
+                            MATERIALIZED_VIEW_STITCHING_FALLBACK,
+                            "Cannot stitch materialized view " + node.getMaterializedViewName() +
+                                    ": the connector reported neither partition-level nor row-level staleness for the stale base tables. " +
+                                    "Falling back to full recompute."));
                 }
             }
         }
@@ -240,7 +255,11 @@ public class MaterializedViewRewrite
             return Optional.empty();
         }
 
-        WarningCollector rowLevelWarnings = partitionLevelAvailable ? WarningCollector.NOOP : context.getWarningCollector();
+        // buildStitchedPlan frames its own declines as a fall back to full recompute, which is
+        // wrong when the partition-level candidate still stands. Buffer them so the reason survives
+        // and can be re-framed, rather than discarding it -- without the reason a decline is
+        // invisible and undiagnosable.
+        BufferingWarningCollector rowLevelWarnings = new BufferingWarningCollector();
         Optional<PlanNode> plan = buildStitchedPlan(
                 metadata,
                 session,
@@ -253,13 +272,46 @@ public class MaterializedViewRewrite
                 context.getLookup(),
                 rowLevelWarnings);
 
-        if (!plan.isPresent() && partitionLevelAvailable) {
-            context.getWarningCollector().add(new PrestoWarning(
-                    MATERIALIZED_VIEW_STITCHING_FALLBACK,
-                    "Cannot use row-level stitching for materialized view " + node.getMaterializedViewName() +
-                            "; falling back to partition-level stitching."));
+        if (plan.isPresent()) {
+            return plan;
         }
-        return plan;
+
+        String reasons = rowLevelWarnings.getWarnings().stream()
+                .map(PrestoWarning::getMessage)
+                .collect(joining("; "));
+        context.getWarningCollector().add(new PrestoWarning(
+                MATERIALIZED_VIEW_STITCHING_FALLBACK,
+                "Cannot use row-level stitching for materialized view " + node.getMaterializedViewName() +
+                        "; falling back to " + (partitionLevelAvailable ? "partition-level stitching" : "full recompute") +
+                        (reasons.isEmpty() ? "." : ". Reason: " + reasons)));
+        return Optional.empty();
+    }
+
+    /**
+     * Holds warnings so a caller can decide whether, and how, to surface them.
+     */
+    private static class BufferingWarningCollector
+            implements WarningCollector
+    {
+        private final List<PrestoWarning> warnings = new ArrayList<>();
+
+        @Override
+        public void add(PrestoWarning warning)
+        {
+            warnings.add(requireNonNull(warning, "warning is null"));
+        }
+
+        @Override
+        public List<PrestoWarning> getWarnings()
+        {
+            return ImmutableList.copyOf(warnings);
+        }
+
+        @Override
+        public boolean hasWarnings()
+        {
+            return !warnings.isEmpty();
+        }
     }
 
     private PlanNode buildAutomaticCandidates(MaterializedViewScanNode node, List<PlanNode> stitchedPlans, PlanNodeIdAllocator idAllocator)

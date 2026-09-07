@@ -52,6 +52,7 @@ import com.facebook.presto.sql.planner.iterative.GroupReference;
 import com.facebook.presto.sql.planner.iterative.Lookup;
 import com.facebook.presto.sql.planner.optimizations.SetOperationNodeUtils;
 import com.facebook.presto.sql.planner.optimizations.SymbolMapper;
+import com.facebook.presto.sql.planner.plan.GroupIdNode;
 import com.facebook.presto.sql.planner.plan.InternalPlanVisitor;
 import com.facebook.presto.sql.relational.FunctionResolution;
 import com.facebook.presto.sql.relational.RowExpressionDeterminismEvaluator;
@@ -226,8 +227,14 @@ public class DifferentialPlanRewriter
         PassthroughColumnEquivalences columnEquivalences = new PassthroughColumnEquivalences(materializedViewDefinition, dataTable);
 
         Map<SchemaTableName, List<TupleDomain<String>>> filteredConstraints = filterPredicatesToMappedColumns(constraints, columnEquivalences);
-        // If any base table is stale yet has no mapped predicates, stitching is not possible
-        if (filteredConstraints.values().stream().anyMatch(List::isEmpty)) {
+        // Needing a mapped partition predicate is a partition-level precondition. A row-level base
+        // is identified by its changed-rows predicate instead, and commonly has no usable partition
+        // predicate at all -- an unpartitioned table being the obvious case -- so applying this to
+        // a row-level base would reject exactly the candidate that can still be built.
+        boolean staleBaseWithoutIdentifier = filteredConstraints.entrySet().stream()
+                .anyMatch(entry -> entry.getValue().isEmpty()
+                        && !isRowLevel(changedRowsPredicates.get(entry.getKey())));
+        if (staleBaseWithoutIdentifier) {
             warningCollector.add(new PrestoWarning(
                     MATERIALIZED_VIEW_STITCHING_FALLBACK,
                     "Cannot use differential stitching for materialized view " + node.getMaterializedViewName() +
@@ -351,10 +358,12 @@ public class DifferentialPlanRewriter
         }
         freshPlan = filterOutStaleRows(metadata, freshPlan, storagePredicates.build(), storageColumns, dataTable, idAllocator);
 
-        for (Map.Entry<SchemaTableName, List<TupleDomain<String>>> entry : constraints.entrySet()) {
+        // Driven by changedRowsPredicates, not by constraints: a row-level base needs no partition
+        // metadata at all, so requiring an entry in constraints would make row-level unreachable for
+        // an unpartitioned base -- exactly the case it exists to serve.
+        for (Map.Entry<SchemaTableName, ChangedRowsPredicate> entry : changedRowsPredicates.entrySet()) {
             SchemaTableName baseTable = entry.getKey();
-            ChangedRowsPredicate changedRows = changedRowsPredicates.get(baseTable);
-            if (!isRowLevel(changedRows)) {
+            if (!isRowLevel(entry.getValue())) {
                 continue;
             }
             freshPlan = antiJoinAffectedIdentifiers(
@@ -364,8 +373,8 @@ public class DifferentialPlanRewriter
                     storageColumns,
                     dataTable,
                     baseTable,
+                    constraints.getOrDefault(baseTable, ImmutableList.of()),
                     entry.getValue(),
-                    changedRows,
                     columnEquivalences,
                     node.getViewQueryPlan(),
                     idAllocator,
@@ -534,12 +543,8 @@ public class DifferentialPlanRewriter
                 .orElseThrow(() -> new UnsupportedOperationException(
                         "row-level refresh of a row-preserving materialized view requires row-origin storage, which is not implemented yet"));
 
-        Map<VariableReferenceExpression, TableColumn> baseColumnByVariable = new HashMap<>();
-        buildColumnToVariableMapping(metadata, session, viewQueryPlan, lookup).forEach((column, variable) -> {
-            if (column.getTableName().equals(baseTable)) {
-                baseColumnByVariable.putIfAbsent(variable, column);
-            }
-        });
+        Map<VariableReferenceExpression, TableColumn> baseColumnByVariable =
+                resolveBaseColumnsByVariable(metadata, session, viewQueryPlan, baseTable, lookup);
 
         ImmutableMap.Builder<String, VariableReferenceExpression> identifiers = ImmutableMap.builder();
         for (VariableReferenceExpression groupingKey : aggregation.getGroupingKeys()) {
@@ -766,6 +771,71 @@ public class DifferentialPlanRewriter
             ColumnMetadata columnMetadata = metadata.getColumnMetadata(session, baseScan.getTable(), column);
             return variableAllocator.newVariable(columnMetadata.getName(), columnMetadata.getType());
         });
+    }
+
+    /**
+     * Maps every variable in the plan that ultimately carries a base table column back to that
+     * column.
+     *
+     * <p>Reading only a TableScan's own assignments is not enough: by the time an aggregation is
+     * reached its grouping keys have usually been renamed, most often by the GroupIdNode the
+     * planner inserts, which turns {@code region} into something like {@code region$gid}. Such a
+     * variable still carries exactly the base column, so it has to resolve to it -- otherwise a
+     * row-level candidate can never identify its affected groups and always declines.
+     *
+     * <p>Only renames are followed. A computed expression is deliberately left unresolved, because
+     * a predicate on a base column says nothing about the value of a function of it.
+     */
+    private static Map<VariableReferenceExpression, TableColumn> resolveBaseColumnsByVariable(
+            Metadata metadata,
+            Session session,
+            PlanNode plan,
+            SchemaTableName baseTable,
+            Lookup lookup)
+    {
+        Map<VariableReferenceExpression, TableColumn> resolved = new HashMap<>();
+        buildColumnToVariableMapping(metadata, session, plan, lookup).forEach((column, variable) -> {
+            if (column.getTableName().equals(baseTable)) {
+                resolved.putIfAbsent(variable, column);
+            }
+        });
+
+        // A rename may sit above another rename, so propagate until nothing new resolves.
+        List<PlanNode> renamingNodes = ImmutableList.<PlanNode>builder()
+                .addAll(searchFrom(plan, lookup).where(ProjectNode.class::isInstance).findAll())
+                .addAll(searchFrom(plan, lookup).where(GroupIdNode.class::isInstance).findAll())
+                .build();
+
+        boolean progressed = true;
+        while (progressed) {
+            progressed = false;
+            for (PlanNode node : renamingNodes) {
+                for (Map.Entry<VariableReferenceExpression, VariableReferenceExpression> rename : renamesOf(node).entrySet()) {
+                    TableColumn source = resolved.get(rename.getValue());
+                    if (source != null && resolved.putIfAbsent(rename.getKey(), source) == null) {
+                        progressed = true;
+                    }
+                }
+            }
+        }
+        return ImmutableMap.copyOf(resolved);
+    }
+
+    /**
+     * The output-to-input variable renames a node performs, ignoring anything that computes a value.
+     */
+    private static Map<VariableReferenceExpression, VariableReferenceExpression> renamesOf(PlanNode node)
+    {
+        if (node instanceof GroupIdNode) {
+            return ((GroupIdNode) node).getGroupingColumns();
+        }
+        ImmutableMap.Builder<VariableReferenceExpression, VariableReferenceExpression> renames = ImmutableMap.builder();
+        ((ProjectNode) node).getAssignments().getMap().forEach((output, expression) -> {
+            if (expression instanceof VariableReferenceExpression) {
+                renames.put(output, (VariableReferenceExpression) expression);
+            }
+        });
+        return renames.buildKeepingLast();
     }
 
     private static TableScanNode findTableScan(
