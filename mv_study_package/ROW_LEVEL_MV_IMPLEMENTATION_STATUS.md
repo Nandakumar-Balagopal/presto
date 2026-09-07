@@ -138,6 +138,37 @@ the binding, so this cannot regress silently.
 `MaterializedViewScanNode`, which is why the fresh branch could be rewritten
 from a filter to an anti-join without any test noticing. It is covered now.
 
+## Known defect: a refresh cannot remove a row
+
+Incremental refresh commits by replacing the partitions of the files it writes, so it can add and
+overwrite rows but never delete one. A view that can stop emitting a group therefore leaves its
+superseded row in storage, and because the watermark still advances the view then reports itself
+fresh and the stale row becomes permanent.
+
+Reproduced with:
+
+```sql
+CREATE TABLE b (region varchar, amount bigint)
+  WITH ("format-version" = '3', partitioning = ARRAY['region']);
+INSERT INTO b VALUES ('NA', 10), ('EU', 5);
+CREATE MATERIALIZED VIEW v WITH (partitioning = ARRAY['region'], refresh_type = 'INCREMENTAL') AS
+  SELECT region, SUM(amount) AS total FROM b GROUP BY region HAVING SUM(amount) > 0;
+REFRESH MATERIALIZED VIEW v;
+INSERT INTO b VALUES ('NA', -10), ('EU', 1);   -- append only; NA now sums to 0
+REFRESH MATERIALIZED VIEW v;
+SELECT * FROM v;   -- returns NA with its old total; should return only EU
+```
+
+This is not specific to row-level refresh, and predates it: the same case fails with
+`materialized_view_row_level_incremental_strategy = NEVER`, on the partition-level delta. Declining
+the delta does not help either, because a full recompute still commits through `ReplacePartitions`
+whenever partition staleness is available, and so still only replaces the partitions it wrote.
+
+Fixing it needs the commit to be able to express a deletion: either the delete-fragment path, or
+forcing `OverwriteFiles.overwriteByRowFilter(alwaysTrue())` for views that can drop a group, which
+requires the engine to tell the connector so. Until then, a view with a HAVING -- or any filter
+above its aggregation -- should not be refreshed incrementally.
+
 ## Remaining work
 
 ### Reachable today

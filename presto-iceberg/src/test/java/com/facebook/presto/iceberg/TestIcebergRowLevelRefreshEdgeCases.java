@@ -486,6 +486,73 @@ public class TestIcebergRowLevelRefreshEdgeCases
         }
     }
 
+    /**
+     * A stale read over a range containing a delete. The changed-rows predicate can only find rows
+     * that are still present, so a removed row is invisible to it and the group it belonged to would
+     * keep its stale aggregate. The connector must therefore withhold row-level staleness for such a
+     * range; this asserts the read is correct and that row-level did not drive it.
+     */
+    @Test
+    public void testStaleReadOverRangeContainingDelete()
+    {
+        String base = "delread_base";
+        String view = "delread_mv";
+        try {
+            // Unpartitioned, so a whole-table DELETE is the only removal a V3 table accepts.
+            assertQuerySucceeds("CREATE TABLE " + base + " (region varchar, amount bigint) WITH (\"format-version\" = '3')");
+            assertQuerySucceeds("INSERT INTO " + base + " VALUES ('NA', 10), ('EU', 20)");
+            assertQuerySucceeds("CREATE MATERIALIZED VIEW " + view
+                    + " WITH (refresh_type = 'INCREMENTAL')"
+                    + " AS SELECT region, SUM(amount) AS total FROM " + base + " GROUP BY region");
+            refreshExpectingFallback(view);
+
+            assertQuerySucceeds("DELETE FROM " + base);
+            assertQuerySucceeds("INSERT INTO " + base + " VALUES ('APAC', 7)");
+
+            // Every row the view had is gone; only APAC should remain.
+            assertEquals(
+                    computeActual(stitchSession(), "SELECT region, total FROM " + view + " ORDER BY region").getMaterializedRows(),
+                    computeActual("SELECT region, SUM(amount) FROM " + base + " GROUP BY region ORDER BY region").getMaterializedRows(),
+                    "stale read over a range containing a delete disagrees with the base");
+
+            refreshExpectingFallback(view);
+            assertViewMatchesBase(
+                    "SELECT region, total FROM " + view + " ORDER BY region",
+                    "SELECT region, SUM(amount) FROM " + base + " GROUP BY region ORDER BY region");
+        }
+        finally {
+            drop(view, base);
+        }
+    }
+
+    /**
+     * The same, with the base partitioned so a partition-level delta is available. Row-level must
+     * still decline, because the removal is invisible to the changed-rows predicate.
+     */
+    @Test
+    public void testRefreshOverRangeContainingDeleteDeclinesRowLevel()
+    {
+        String base = "delref_base";
+        String view = "delref_mv";
+        try {
+            create(base, "region varchar, amount bigint", "ARRAY['region']");
+            assertQuerySucceeds("INSERT INTO " + base + " VALUES ('NA', 10), ('EU', 20), ('APAC', 30)");
+            createView(view, base, "ARRAY['region']", "SELECT region, SUM(amount) AS total FROM " + base + " GROUP BY region");
+            refreshExpectingFallback(view);
+
+            assertQuerySucceeds("DELETE FROM " + base + " WHERE region = 'EU'");
+            assertQuerySucceeds("INSERT INTO " + base + " VALUES ('NA', 5)");
+            refreshExpectingFallback(view);
+
+            assertViewMatchesBase(
+                    "SELECT region, total FROM " + view + " ORDER BY region",
+                    "SELECT region, SUM(amount) FROM " + base + " GROUP BY region ORDER BY region");
+        }
+        finally {
+            drop(view, base);
+        }
+    }
+
     // ------------------------------------------------------------- boilerplate
 
     private void run(

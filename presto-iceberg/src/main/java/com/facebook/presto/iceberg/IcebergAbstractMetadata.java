@@ -108,6 +108,7 @@ import org.apache.iceberg.ChangelogScanTask;
 import org.apache.iceberg.ContentScanTask;
 import org.apache.iceberg.DataFile;
 import org.apache.iceberg.DataFiles;
+import org.apache.iceberg.DataOperations;
 import org.apache.iceberg.DeleteFiles;
 import org.apache.iceberg.FileFormat;
 import org.apache.iceberg.FileMetadata;
@@ -149,6 +150,7 @@ import org.apache.iceberg.types.Types;
 import org.apache.iceberg.types.Types.NestedField;
 import org.apache.iceberg.types.Types.StringType;
 import org.apache.iceberg.util.CharSequenceSet;
+import org.apache.iceberg.util.SnapshotUtil;
 import org.apache.iceberg.view.View;
 
 import java.io.IOException;
@@ -1469,6 +1471,24 @@ public abstract class IcebergAbstractMetadata
                 columns);
     }
 
+    /**
+     * Whether every snapshot after {@code fromSnapshotId} up to and including {@code toSnapshotId}
+     * only added data. Anything else -- a delete, an overwrite, a compaction rewrite -- can remove
+     * rows, which a predicate over the row-lineage sequence number cannot detect.
+     */
+    private static boolean isAppendOnlyRange(Table table, long fromSnapshotId, long toSnapshotId)
+    {
+        if (toSnapshotId == 0 || fromSnapshotId == toSnapshotId) {
+            return true;
+        }
+        for (Snapshot snapshot : SnapshotUtil.ancestorsBetween(table, toSnapshotId, fromSnapshotId)) {
+            if (!DataOperations.APPEND.equals(snapshot.operation())) {
+                return false;
+            }
+        }
+        return true;
+    }
+
     private static IcebergTableLayoutHandle createChangeSetLayout(
             IcebergTableHandle tableHandle,
             Table table,
@@ -2401,7 +2421,16 @@ public abstract class IcebergAbstractMetadata
 
             // Row-level change tracking requires a concrete recorded snapshot. A base table
             // with no recorded snapshot continues through the existing partition path.
-            if (recordedSnapshotId != 0 && supportsRowLineage(baseIcebergTable)) {
+            //
+            // It also requires the range to contain nothing but appends. The changed-rows predicate
+            // identifies changed rows by their sequence number, which can only find rows that are
+            // still there, so a row removed in the range is invisible to it. A group that lost all
+            // its rows would keep its stale aggregate: the engine excludes it from the fresh branch
+            // and has nothing to recompute it from. Withholding the predicate here leaves such a
+            // range to the partition-level path, which derives changed partitions from metadata and
+            // does see the removals.
+            if (recordedSnapshotId != 0 && supportsRowLineage(baseIcebergTable)
+                    && isAppendOnlyRange(baseIcebergTable, recordedSnapshotId, currentSnapshotId)) {
                 Snapshot recordedSnapshot = baseIcebergTable.snapshot(recordedSnapshotId);
                 if (recordedSnapshot != null) {
                     ConnectorTableVersion recordedVersion = new ConnectorTableVersion(
