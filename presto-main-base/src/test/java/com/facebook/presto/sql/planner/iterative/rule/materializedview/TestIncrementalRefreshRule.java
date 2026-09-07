@@ -165,8 +165,11 @@ public class TestIncrementalRefreshRule
     }
 
     @Test
-    public void testFallsBackWhenStorageDoesNotSupportAtomicRowReplacement()
+    public void testRowLevelChangesDoNotSuppressRefresh()
     {
+        // A base table reporting row-level changes must not lose the refresh it can still do. This
+        // rule builds no row-level plan, so it proceeds on the partition-level predicates; the
+        // Values source here cannot be delta-planned, so the fallback is the source itself.
         MaterializedViewStatus status = new MaterializedViewStatus(
                 PARTIALLY_MATERIALIZED,
                 ImmutableMap.of(

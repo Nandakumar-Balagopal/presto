@@ -143,13 +143,16 @@ public class IncrementalRefreshRule
 
         MaterializedViewStatus status = metadataResolver.getMaterializedViewStatus(qualifiedViewName, TupleDomain.all());
 
-        if (status.hasRowLevelChanges() && !metadata.supportsMaterializedViewRowLevelRefresh(session, storageTableHandle)) {
-            context.getWarningCollector().add(new PrestoWarning(
-                    MATERIALIZED_VIEW_STITCHING_FALLBACK,
-                    "Cannot perform row-level incremental refresh for materialized view " + qualifiedViewName +
-                            ": the storage connector does not support atomic affected-row replacement. Falling back to full refresh."));
-            return Result.ofPlanNode(node.getSource());
-        }
+        // No capability check here. This rule builds no row-level plan, so refusing to refresh
+        // when the storage table cannot replace affected rows only downgraded the refresh it could
+        // still do: a base table with row lineage reported row-level changes, no connector declares
+        // supportsMaterializedViewRowLevelRefresh, and the refresh fell all the way back to a full
+        // recompute -- strictly worse than the partition-level refresh the same table would have got
+        // without row lineage. Partition-level staleness covers row-level changes too, because the
+        // connector derives changed partitions over the same snapshot range.
+        //
+        // When this rule gains a row-level plan the check belongs at that choice, gating row-level
+        // against partition-level, not gating refresh as a whole.
 
         // If fully materialized, nothing to refresh - return empty result
         if (status.isFullyMaterialized()) {
