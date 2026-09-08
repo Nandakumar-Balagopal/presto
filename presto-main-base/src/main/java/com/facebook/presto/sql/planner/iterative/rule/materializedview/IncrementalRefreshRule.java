@@ -214,9 +214,14 @@ public class IncrementalRefreshRule
             }
         }
 
-        // Without partition data the connector commits a refresh by overwriting the whole storage
-        // table, so no partial delta of any granularity can be written safely.
-        if (!status.hasPartitionRefreshData()) {
+        // Bail out only when the connector reported no stale base at all. A base that is stale but
+        // carries no partition disjuncts -- an unpartitioned or bounded V3 base -- must still reach
+        // the predicate rewriter below: its incrementalRefreshPredicate is the whole point of a
+        // bounded refresh, and the full storage overwrite the connector then performs is exactly
+        // the right commit for a recompute that is complete up to that bound. Requiring
+        // hasPartitionRefreshData() here, as the row-level guard above legitimately does, silently
+        // dropped that bound and refreshed unbounded.
+        if (status.getPartitionsFromBaseTables().isEmpty()) {
             context.getWarningCollector().add(new PrestoWarning(
                     MATERIALIZED_VIEW_STITCHING_FALLBACK,
                     "Cannot perform incremental refresh for materialized view " + qualifiedViewName +
