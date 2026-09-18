@@ -20,6 +20,7 @@ import com.facebook.presto.common.predicate.TupleDomain;
 import com.facebook.presto.matching.Captures;
 import com.facebook.presto.matching.Pattern;
 import com.facebook.presto.metadata.Metadata;
+import com.facebook.presto.spi.ChangedRowsPredicate;
 import com.facebook.presto.spi.ColumnHandle;
 import com.facebook.presto.spi.ColumnMetadata;
 import com.facebook.presto.spi.MaterializedViewDefinition;
@@ -47,20 +48,22 @@ import com.facebook.presto.sql.planner.iterative.Lookup;
 import com.facebook.presto.sql.planner.iterative.Rule;
 import com.facebook.presto.sql.planner.plan.SimplePlanRewriter;
 import com.facebook.presto.sql.relational.RowExpressionDomainTranslator;
-import com.google.common.collect.ImmutableBiMap;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.ImmutableSet;
 
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 
 import static com.facebook.presto.SystemSessionProperties.getMaterializedViewDefaultRefreshType;
 import static com.facebook.presto.SystemSessionProperties.getMaterializedViewIncrementalRefreshStrategy;
 import static com.facebook.presto.SystemSessionProperties.isLegacyMaterializedViews;
+import static com.facebook.presto.expressions.LogicalRowExpressions.and;
 import static com.facebook.presto.spi.MaterializedViewStatus.MaterializedDataPredicates;
 import static com.facebook.presto.spi.StandardErrorCode.NOT_FOUND;
 import static com.facebook.presto.spi.StandardWarningCode.MATERIALIZED_VIEW_STITCHING_FALLBACK;
@@ -69,6 +72,8 @@ import static com.facebook.presto.sql.planner.plan.AssignmentUtils.identityAssig
 import static com.facebook.presto.sql.planner.plan.Patterns.refreshMaterializedViewNode;
 import static com.google.common.collect.ImmutableList.toImmutableList;
 import static com.google.common.collect.ImmutableMap.toImmutableMap;
+import static com.google.common.collect.ImmutableSet.toImmutableSet;
+import static java.util.Locale.ENGLISH;
 import static java.util.Objects.requireNonNull;
 
 /**
@@ -92,6 +97,13 @@ public class IncrementalRefreshRule
         implements Rule<RefreshMaterializedViewNode>
 {
     private static final Pattern<RefreshMaterializedViewNode> PATTERN = refreshMaterializedViewNode();
+    /**
+     * The table property connectors expose their partition columns under. Named here rather than
+     * imported because the engine cannot depend on a connector; it matches Iceberg's
+     * IcebergTableProperties.PARTITIONING_PROPERTY, and an absent or differently named property
+     * simply reads as unpartitioned, which keeps the refresh at partition-level.
+     */
+    private static final String PARTITIONING_PROPERTY = "partitioning";
 
     private final Metadata metadata;
 
@@ -143,6 +155,11 @@ public class IncrementalRefreshRule
 
         MaterializedViewStatus status = metadataResolver.getMaterializedViewStatus(qualifiedViewName, TupleDomain.all());
 
+        // Row-level eligibility is decided below, against the storage table's partitioning, rather
+        // than by a blanket capability check here. Bailing out at this point used to send a base
+        // table with row lineage all the way to a full recompute -- strictly worse than the
+        // partition-level refresh the same table would have received without it.
+
         // If fully materialized, nothing to refresh - return empty result
         if (status.isFullyMaterialized()) {
             return Result.ofPlanNode(new ValuesNode(
@@ -162,13 +179,54 @@ public class IncrementalRefreshRule
             return Result.ofPlanNode(node.getSource());
         }
 
-        // If no partition info available (unpartitioned tables or connector doesn't track partitions),
-        // fall back to full refresh since we can't determine which partitions are stale
+        SchemaTableName dataTable = new SchemaTableName(materializedViewDefinition.get().getSchema(), materializedViewDefinition.get().getTable());
+        PassthroughColumnEquivalences columnEquivalences = new PassthroughColumnEquivalences(materializedViewDefinition.get(), dataTable);
+
+        // Row-level refresh recomputes only the changed groups. Safe to commit only when the storage
+        // table is partitioned by exactly the view's grouping columns, because the refresh replaces
+        // the partitions of the files it writes; see rowLevelReplacementIsSafe.
+        Map<SchemaTableName, ChangedRowsPredicate> rowLevelPredicates = ImmutableMap.of();
+        // hasPartitionRefreshData is required even though row-level staleness needs no partition
+        // metadata, because the connector decides how to commit from the same signal: without it,
+        // Iceberg treats the refresh as a full rewrite and overwrites the storage table by
+        // alwaysTrue(), which would discard every group the row-level delta did not recompute.
+        // Writing a partial delta is only safe once the commit replaces partitions instead.
+        if (status.hasRowLevelChanges()
+                && status.hasPartitionRefreshData()
+                && RowLevelRefreshEnablement.isEnabled(session, materializedViewDefinition.get().getRowLevelIncrementalRefresh())) {
+            if (DifferentialPlanRewriter.rowLevelReplacementIsSafe(
+                    metadata,
+                    session,
+                    node.getSource(),
+                    dataTable,
+                    columnEquivalences,
+                    storagePartitionColumns(metadata, session, storageTableHandle),
+                    context.getLookup())) {
+                rowLevelPredicates = status.getChangedRowsPredicates();
+            }
+            else {
+                context.getWarningCollector().add(new PrestoWarning(
+                        MATERIALIZED_VIEW_STITCHING_FALLBACK,
+                        "Cannot perform row-level incremental refresh for materialized view " + qualifiedViewName +
+                                ": the storage table is not partitioned by the view's grouping columns, so only whole " +
+                                "partitions can be replaced. Falling back to partition-level incremental refresh."));
+            }
+        }
+
+        // Bail out only when the connector reported no stale base at all. A base that is stale but
+        // carries no partition disjuncts -- an unpartitioned or bounded V3 base -- must still reach
+        // the predicate rewriter below: its incrementalRefreshPredicate is the whole point of a
+        // bounded refresh, and the full storage overwrite the connector then performs is exactly
+        // the right commit for a recompute that is complete up to that bound. Requiring
+        // hasPartitionRefreshData() here, as the row-level guard above legitimately does, silently
+        // dropped that bound and refreshed unbounded.
         if (status.getPartitionsFromBaseTables().isEmpty()) {
             context.getWarningCollector().add(new PrestoWarning(
                     MATERIALIZED_VIEW_STITCHING_FALLBACK,
                     "Cannot perform incremental refresh for materialized view " + qualifiedViewName +
-                            ": no partition-level staleness available (unpartitioned base, untracked partitions, or non-append base changes). Falling back to full refresh."));
+                            ": no partition-level staleness available (unpartitioned base, untracked partitions, or " +
+                            "non-append base changes), and the refresh commit replaces the whole storage table without " +
+                            "it. Falling back to full refresh."));
             return Result.ofPlanNode(node.getSource());
         }
 
@@ -178,8 +236,13 @@ public class IncrementalRefreshRule
                 .filter(entry -> !entry.getValue().getIncrementalRefreshPredicate().isAll())
                 .collect(toImmutableMap(Map.Entry::getKey, entry -> entry.getValue().getIncrementalRefreshPredicate()));
 
-        SchemaTableName dataTable = new SchemaTableName(materializedViewDefinition.get().getSchema(), materializedViewDefinition.get().getTable());
-        PassthroughColumnEquivalences columnEquivalences = new PassthroughColumnEquivalences(materializedViewDefinition.get(), dataTable);
+        // The row-level analogue of incrementalRefreshPredicate: a refresh-only cap on the change
+        // sequence number, so a bounded refresh advances the watermark only as far as it recomputed.
+        // Like its partition-level counterpart this narrows the refresh and must never be applied to
+        // a stale read, where dropping rows beyond the cap would lose data the query has to return.
+        Map<SchemaTableName, TupleDomain<ColumnHandle>> refreshBounds = status.getChangedRowsPredicates().entrySet().stream()
+                .filter(entry -> !entry.getValue().getRefreshBound().isAll())
+                .collect(toImmutableMap(Map.Entry::getKey, entry -> entry.getValue().getRefreshBound()));
 
         Map<SchemaTableName, List<TupleDomain<String>>> filteredConstraints =
                 filterToValidRefreshColumns(materializedViewDefinition.get(), constraints, columnEquivalences, dataTable);
@@ -190,7 +253,7 @@ public class IncrementalRefreshRule
                     "Cannot perform incremental refresh for materialized view " + qualifiedViewName +
                             ": stale columns are not valid refresh columns. Falling back to full refresh."));
             return Result.ofPlanNode(applyIncrementalRefreshPredicates(
-                    node.getSource(), incrementalRefreshPredicates, session, idAllocator, variableAllocator, metadata, context.getLookup()));
+                    node.getSource(), incrementalRefreshPredicates, refreshBounds, session, idAllocator, variableAllocator, metadata, context.getLookup()));
         }
 
         Optional<PlanNode> deltaPlan = buildDeltaPlanForRefresh(
@@ -200,6 +263,7 @@ public class IncrementalRefreshRule
                 idAllocator,
                 variableAllocator,
                 filteredConstraints,
+                rowLevelPredicates,
                 columnEquivalences,
                 context.getLookup(),
                 context.getWarningCollector());
@@ -210,15 +274,15 @@ public class IncrementalRefreshRule
                     "Cannot perform incremental refresh for materialized view " + qualifiedViewName +
                             ": unsupported operation in view query. Falling back to full refresh."));
             return Result.ofPlanNode(applyIncrementalRefreshPredicates(
-                    node.getSource(), incrementalRefreshPredicates, session, idAllocator, variableAllocator, metadata, context.getLookup()));
+                    node.getSource(), incrementalRefreshPredicates, refreshBounds, session, idAllocator, variableAllocator, metadata, context.getLookup()));
         }
 
         PlanNode deltaWithPredicates = applyIncrementalRefreshPredicates(
-                deltaPlan.get(), incrementalRefreshPredicates, session, idAllocator, variableAllocator, metadata, context.getLookup());
+                deltaPlan.get(), incrementalRefreshPredicates, refreshBounds, session, idAllocator, variableAllocator, metadata, context.getLookup());
 
         if (strategy == MaterializedViewRewriteStrategy.AUTOMATIC) {
             PlanNode fullWithPredicates = applyIncrementalRefreshPredicates(
-                    node.getSource(), incrementalRefreshPredicates, session, idAllocator, variableAllocator, metadata, context.getLookup());
+                    node.getSource(), incrementalRefreshPredicates, refreshBounds, session, idAllocator, variableAllocator, metadata, context.getLookup());
             return Result.ofPlanNode(new MVRewriteCandidatesNode(
                     node.getSourceLocation(),
                     idAllocator.getNextId(),
@@ -232,6 +296,21 @@ public class IncrementalRefreshRule
         }
 
         return Result.ofPlanNode(deltaWithPredicates);
+    }
+
+    /**
+     * The storage table's partition column names, as the connector reports them.
+     */
+    private static Set<String> storagePartitionColumns(Metadata metadata, Session session, TableHandle storageTableHandle)
+    {
+        Object partitioning = metadata.getTableMetadata(session, storageTableHandle).getMetadata().getProperties().get(PARTITIONING_PROPERTY);
+        if (!(partitioning instanceof Collection)) {
+            return ImmutableSet.of();
+        }
+        return ((Collection<?>) partitioning).stream()
+                .map(String::valueOf)
+                .map(column -> column.toLowerCase(ENGLISH))
+                .collect(toImmutableSet());
     }
 
     /**
@@ -325,18 +404,19 @@ public class IncrementalRefreshRule
     private static PlanNode applyIncrementalRefreshPredicates(
             PlanNode plan,
             Map<SchemaTableName, TupleDomain<String>> perBasePredicates,
+            Map<SchemaTableName, TupleDomain<ColumnHandle>> perBaseRefreshBounds,
             Session session,
             PlanNodeIdAllocator idAllocator,
             VariableAllocator variableAllocator,
             Metadata metadata,
             Lookup lookup)
     {
-        if (perBasePredicates.isEmpty()) {
+        if (perBasePredicates.isEmpty() && perBaseRefreshBounds.isEmpty()) {
             return plan;
         }
         return SimplePlanRewriter.rewriteWith(
                 new IncrementalRefreshPredicateRewriter(
-                        perBasePredicates, session, idAllocator, variableAllocator, metadata, lookup),
+                        perBasePredicates, perBaseRefreshBounds, session, idAllocator, variableAllocator, metadata, lookup),
                 plan);
     }
 
@@ -344,6 +424,7 @@ public class IncrementalRefreshRule
             extends SimplePlanRewriter<Void>
     {
         private final Map<SchemaTableName, TupleDomain<String>> perBasePredicates;
+        private final Map<SchemaTableName, TupleDomain<ColumnHandle>> perBaseRefreshBounds;
         private final Session session;
         private final PlanNodeIdAllocator idAllocator;
         private final VariableAllocator variableAllocator;
@@ -353,6 +434,7 @@ public class IncrementalRefreshRule
 
         IncrementalRefreshPredicateRewriter(
                 Map<SchemaTableName, TupleDomain<String>> perBasePredicates,
+                Map<SchemaTableName, TupleDomain<ColumnHandle>> perBaseRefreshBounds,
                 Session session,
                 PlanNodeIdAllocator idAllocator,
                 VariableAllocator variableAllocator,
@@ -360,6 +442,7 @@ public class IncrementalRefreshRule
                 Lookup lookup)
         {
             this.perBasePredicates = requireNonNull(perBasePredicates, "perBasePredicates is null");
+            this.perBaseRefreshBounds = requireNonNull(perBaseRefreshBounds, "perBaseRefreshBounds is null");
             this.session = requireNonNull(session, "session is null");
             this.idAllocator = requireNonNull(idAllocator, "idAllocator is null");
             this.variableAllocator = requireNonNull(variableAllocator, "variableAllocator is null");
@@ -379,34 +462,59 @@ public class IncrementalRefreshRule
         public PlanNode visitTableScan(TableScanNode node, RewriteContext<Void> context)
         {
             SchemaTableName tableName = metadata.getTableMetadata(session, node.getTable()).getTable();
-            TupleDomain<String> predicate = perBasePredicates.get(tableName);
-            if (predicate == null || predicate.isAll() || !predicate.getDomains().isPresent()) {
+            TupleDomain<String> byName = perBasePredicates.getOrDefault(tableName, TupleDomain.all());
+            TupleDomain<ColumnHandle> byHandle = perBaseRefreshBounds.getOrDefault(tableName, TupleDomain.all());
+            if (isUnconstrained(byName) && isUnconstrained(byHandle)) {
                 return node;
             }
 
             Map<String, ColumnHandle> columnHandles = metadata.getColumnHandles(session, node.getTable());
-            Map<ColumnHandle, VariableReferenceExpression> variableByColumnHandle =
-                    ImmutableBiMap.copyOf(node.getAssignments()).inverse();
+
+            // A column can be read into more than one variable; either binding evaluates the same,
+            // so keep the first rather than letting an inverted map reject the duplicate.
+            Map<ColumnHandle, VariableReferenceExpression> variableByColumnHandle = new HashMap<>();
+            node.getAssignments().forEach((variable, handle) -> variableByColumnHandle.putIfAbsent(handle, variable));
 
             List<VariableReferenceExpression> outputs = new ArrayList<>(node.getOutputVariables());
             Map<VariableReferenceExpression, ColumnHandle> assignments = new HashMap<>(node.getAssignments());
-            Map<String, VariableReferenceExpression> columnToVariable = new HashMap<>();
-            for (String columnName : predicate.getDomains().get().keySet()) {
+
+            // Resolve every column both predicates constrain, reading it from the table when the
+            // scan does not already produce it. The refresh bound in particular is expressed over a
+            // change-tracking column the view query has no reason to project.
+            Map<ColumnHandle, VariableReferenceExpression> resolved = new HashMap<>();
+            List<ColumnHandle> required = new ArrayList<>();
+            for (String columnName : byName.getDomains().orElse(ImmutableMap.of()).keySet()) {
                 ColumnHandle columnHandle = columnHandles.get(columnName);
                 if (columnHandle == null) {
                     // Connector doesn't expose this column; skip the bound and run unbounded.
                     return node;
                 }
+                required.add(columnHandle);
+            }
+            required.addAll(byHandle.getDomains().orElse(ImmutableMap.of()).keySet());
+
+            for (ColumnHandle columnHandle : required) {
+                if (resolved.containsKey(columnHandle)) {
+                    continue;
+                }
                 VariableReferenceExpression existing = variableByColumnHandle.get(columnHandle);
                 if (existing != null) {
-                    columnToVariable.put(columnName, existing);
+                    resolved.put(columnHandle, existing);
                     continue;
                 }
                 ColumnMetadata columnMetadata = metadata.getColumnMetadata(session, node.getTable(), columnHandle);
-                VariableReferenceExpression newVar = variableAllocator.newVariable(columnName, columnMetadata.getType());
+                VariableReferenceExpression newVar = variableAllocator.newVariable(columnMetadata.getName(), columnMetadata.getType());
                 outputs.add(newVar);
                 assignments.put(newVar, columnHandle);
-                columnToVariable.put(columnName, newVar);
+                resolved.put(columnHandle, newVar);
+            }
+
+            ImmutableList.Builder<RowExpression> predicates = ImmutableList.builder();
+            if (!isUnconstrained(byName)) {
+                predicates.add(translator.toPredicate(byName.transform(column -> resolved.get(columnHandles.get(column)))));
+            }
+            if (!isUnconstrained(byHandle)) {
+                predicates.add(translator.toPredicate(byHandle.transform(resolved::get)));
             }
 
             boolean addedColumns = outputs.size() != node.getOutputVariables().size();
@@ -423,17 +531,21 @@ public class IncrementalRefreshRule
                             node.getCteMaterializationInfo())
                     : node;
 
-            RowExpression filterPredicate = translator.toPredicate(predicate.transform(columnToVariable::get));
             FilterNode filterNode = new FilterNode(
                     node.getSourceLocation(),
                     idAllocator.getNextId(),
                     rewrittenScan,
-                    filterPredicate);
+                    and(predicates.build()));
 
             if (!addedColumns) {
                 return filterNode;
             }
             return new ProjectNode(idAllocator.getNextId(), filterNode, identityAssignments(node.getOutputVariables()));
+        }
+
+        private static <T> boolean isUnconstrained(TupleDomain<T> domain)
+        {
+            return domain.isAll() || !domain.getDomains().isPresent();
         }
     }
 }
