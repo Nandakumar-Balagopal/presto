@@ -65,13 +65,20 @@ public class GlobalSystemConnector
     private final Set<SystemTable> systemTables;
     private final Set<Procedure> procedures;
     private final Set<ConnectorTableFunction> tableFunctions;
+    private final Changes changes;
 
     public GlobalSystemConnector(String connectorId, Set<SystemTable> systemTables, Set<Procedure> procedures, Set<ConnectorTableFunction> tableFunctions)
+    {
+        this(connectorId, systemTables, procedures, tableFunctions, null);
+    }
+
+    public GlobalSystemConnector(String connectorId, Set<SystemTable> systemTables, Set<Procedure> procedures, Set<ConnectorTableFunction> tableFunctions, Changes changes)
     {
         this.connectorId = requireNonNull(connectorId, "connectorId is null");
         this.systemTables = ImmutableSet.copyOf(requireNonNull(systemTables, "systemTables is null"));
         this.procedures = ImmutableSet.copyOf(requireNonNull(procedures, "procedures is null"));
         this.tableFunctions = ImmutableSet.copyOf(requireNonNull(tableFunctions, "tableFunctions is null"));
+        this.changes = changes;
     }
 
     @Override
@@ -158,7 +165,13 @@ public class GlobalSystemConnector
             @Override
             public ConnectorSplitSource getSplits(ConnectorTransactionHandle transaction, ConnectorSession session, ConnectorTableFunctionHandle function)
             {
-                if (function instanceof Sequence.SequenceFunctionHandle) {
+                if (function instanceof Changes.ChangesFunctionHandle) {
+                    if (changes == null) {
+                        throw new UnsupportedOperationException();
+                    }
+                    return changes.getSplitSource((Changes.ChangesFunctionHandle) function);
+                }
+                else if (function instanceof Sequence.SequenceFunctionHandle) {
                     Sequence.SequenceFunctionHandle sequenceFunctionHandle = (Sequence.SequenceFunctionHandle) function;
                     return getSequenceFunctionSplitSource(sequenceFunctionHandle);
                 }
@@ -206,6 +219,9 @@ public class GlobalSystemConnector
             }
             else if (connectorTableFunctionHandle instanceof Sequence.SequenceFunctionHandle) {
                 return Sequence.getSequenceFunctionProcessorProvider();
+            }
+            else if (connectorTableFunctionHandle instanceof Changes.ChangesFunctionHandle && changes != null) {
+                return changes.getProcessorProvider();
             }
             return null;
         };
