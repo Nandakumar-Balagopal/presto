@@ -21,6 +21,7 @@ import com.facebook.presto.common.predicate.TupleDomain;
 import com.facebook.presto.common.type.Type;
 import com.facebook.presto.common.type.TypeSignature;
 import com.facebook.presto.metadata.Catalog.CatalogContext;
+import com.facebook.presto.spi.ChangeKindPageSource;
 import com.facebook.presto.spi.ColumnHandle;
 import com.facebook.presto.spi.ColumnMetadata;
 import com.facebook.presto.spi.ConnectorId;
@@ -96,6 +97,18 @@ public interface Metadata
      * Returns a table handle for time travel expression
      */
     Optional<TableHandle> getHandleVersion(Session session, QualifiedObjectName tableName, Optional<ConnectorTableVersion> tableVersion);
+
+    Optional<ConnectorTableVersion> getCurrentTableVersion(Session session, TableHandle tableHandle);
+
+    ChangeKindPageSource getChangeSet(
+            Session session,
+            TableHandle tableHandle,
+            ConnectorTableVersion from,
+            ConnectorTableVersion to,
+            List<ColumnHandle> projectedDataColumns,
+            TupleDomain<ColumnHandle> filter);
+
+    OptionalLong estimateChangeSetSize(Session session, TableHandle tableHandle, ConnectorTableVersion from, ConnectorTableVersion to);
 
     Optional<TableHandle> getTableHandleForStatisticsCollection(Session session, QualifiedObjectName tableName, Map<String, Object> analyzeProperties);
 
@@ -504,6 +517,14 @@ public interface Metadata
      */
     Optional<ConnectorOutputMetadata> finishRefreshMaterializedView(Session session, InsertTableHandle tableHandle, Collection<Slice> fragments, Collection<ComputedStatistics> computedStatistics);
 
+    default Optional<ConnectorOutputMetadata> finishRefreshMaterializedView(Session session, InsertTableHandle tableHandle, Collection<Slice> deleteFragments, Collection<Slice> insertFragments, Collection<ComputedStatistics> computedStatistics)
+    {
+        if (!deleteFragments.isEmpty()) {
+            throw new PrestoException(NOT_SUPPORTED, "Atomic delete and insert materialized view refresh is not supported");
+        }
+        return finishRefreshMaterializedView(session, tableHandle, insertFragments, computedStatistics);
+    }
+
     /**
      * Gets the referenced materialized views for a give table
      */
@@ -513,6 +534,16 @@ public interface Metadata
      * Gets the status of a materialized view (freshness state)
      */
     MaterializedViewStatus getMaterializedViewStatus(Session session, QualifiedObjectName viewName, TupleDomain<String> baseQueryDomain);
+
+    /**
+     * Whether the materialized view's storage table can atomically replace the affected rows of a
+     * refresh. Connectors opt in; the default keeps row-level refresh off so that a connector which
+     * has not implemented the atomic delete-plus-insert commit falls back to partition-level refresh.
+     */
+    default boolean supportsMaterializedViewRowLevelRefresh(Session session, TableHandle materializedViewTable)
+    {
+        return false;
+    }
 
     /**
      * Try to locate a table index that can lookup results by indexableColumns and provide the requested outputColumns.

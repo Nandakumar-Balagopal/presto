@@ -27,6 +27,7 @@ import com.facebook.presto.common.predicate.TupleDomain;
 import com.facebook.presto.common.type.Type;
 import com.facebook.presto.common.type.TypeSignature;
 import com.facebook.presto.metadata.Catalog.CatalogContext;
+import com.facebook.presto.spi.ChangeKindPageSource;
 import com.facebook.presto.spi.ColumnHandle;
 import com.facebook.presto.spi.ColumnMetadata;
 import com.facebook.presto.spi.ConnectorDeleteTableHandle;
@@ -35,6 +36,7 @@ import com.facebook.presto.spi.ConnectorId;
 import com.facebook.presto.spi.ConnectorInsertTableHandle;
 import com.facebook.presto.spi.ConnectorMergeTableHandle;
 import com.facebook.presto.spi.ConnectorOutputTableHandle;
+import com.facebook.presto.spi.ConnectorRefreshMaterializedViewHandle;
 import com.facebook.presto.spi.ConnectorResolvedIndex;
 import com.facebook.presto.spi.ConnectorSession;
 import com.facebook.presto.spi.ConnectorTableHandle;
@@ -444,6 +446,39 @@ public class MetadataManager
     public Optional<TableHandle> getHandleVersion(Session session, QualifiedObjectName tableName, Optional<ConnectorTableVersion> tableVersion)
     {
         return getOptionalTableHandle(session, transactionManager, tableName, tableVersion);
+    }
+
+    @Override
+    public Optional<ConnectorTableVersion> getCurrentTableVersion(Session session, TableHandle tableHandle)
+    {
+        ConnectorId connectorId = tableHandle.getConnectorId();
+        return getMetadata(session, connectorId).getCurrentTableVersion(session.toConnectorSession(connectorId), tableHandle.getConnectorHandle());
+    }
+
+    @Override
+    public ChangeKindPageSource getChangeSet(
+            Session session,
+            TableHandle tableHandle,
+            ConnectorTableVersion from,
+            ConnectorTableVersion to,
+            List<ColumnHandle> projectedDataColumns,
+            TupleDomain<ColumnHandle> filter)
+    {
+        ConnectorId connectorId = tableHandle.getConnectorId();
+        return getMetadata(session, connectorId).getChangeSet(
+                session.toConnectorSession(connectorId),
+                tableHandle.getConnectorHandle(),
+                from,
+                to,
+                projectedDataColumns,
+                filter);
+    }
+
+    @Override
+    public OptionalLong estimateChangeSetSize(Session session, TableHandle tableHandle, ConnectorTableVersion from, ConnectorTableVersion to)
+    {
+        ConnectorId connectorId = tableHandle.getConnectorId();
+        return getMetadata(session, connectorId).estimateChangeSetSize(session.toConnectorSession(connectorId), tableHandle.getConnectorHandle(), from, to);
     }
 
     @Override
@@ -1408,6 +1443,16 @@ public class MetadataManager
     }
 
     @Override
+    public boolean supportsMaterializedViewRowLevelRefresh(Session session, TableHandle materializedViewTable)
+    {
+        ConnectorId connectorId = materializedViewTable.getConnectorId();
+        ConnectorMetadata metadata = getMetadata(session, connectorId);
+        return metadata.supportsMaterializedViewRowLevelRefresh(
+                session.toConnectorSession(connectorId),
+                materializedViewTable.getConnectorHandle());
+    }
+
+    @Override
     public InsertTableHandle beginRefreshMaterializedView(Session session, TableHandle tableHandle, Optional<RowExpression> refreshScopePredicate)
     {
         ConnectorId connectorId = tableHandle.getConnectorId();
@@ -1426,7 +1471,26 @@ public class MetadataManager
         // beginRefreshMaterializedView (some connectors, e.g. Prism, return distinct read/write
         // instances); this lets a connector read state set during begin (e.g. the refresh scope).
         ConnectorMetadata metadata = getMetadataForWrite(session, connectorId);
-        return metadata.finishRefreshMaterializedView(session.toConnectorSession(connectorId), tableHandle.getConnectorHandle(), fragments, computedStatistics);
+        ConnectorInsertTableHandle connectorHandle = tableHandle.getConnectorHandle();
+        if (connectorHandle instanceof ConnectorRefreshMaterializedViewHandle) {
+            return metadata.finishRefreshMaterializedView(session.toConnectorSession(connectorId), (ConnectorRefreshMaterializedViewHandle) connectorHandle, fragments, computedStatistics);
+        }
+        return metadata.finishRefreshMaterializedView(session.toConnectorSession(connectorId), connectorHandle, fragments, computedStatistics);
+    }
+
+    @Override
+    public Optional<ConnectorOutputMetadata> finishRefreshMaterializedView(Session session, InsertTableHandle tableHandle, Collection<Slice> deleteFragments, Collection<Slice> insertFragments, Collection<ComputedStatistics> computedStatistics)
+    {
+        ConnectorId connectorId = tableHandle.getConnectorId();
+        ConnectorMetadata metadata = getMetadataForWrite(session, connectorId);
+        ConnectorInsertTableHandle connectorHandle = tableHandle.getConnectorHandle();
+        if (!(connectorHandle instanceof ConnectorRefreshMaterializedViewHandle)) {
+            if (!deleteFragments.isEmpty()) {
+                throw new PrestoException(NOT_SUPPORTED, "Atomic delete and insert materialized view refresh is not supported");
+            }
+            return metadata.finishRefreshMaterializedView(session.toConnectorSession(connectorId), connectorHandle, insertFragments, computedStatistics);
+        }
+        return metadata.finishRefreshMaterializedView(session.toConnectorSession(connectorId), (ConnectorRefreshMaterializedViewHandle) connectorHandle, deleteFragments, insertFragments, computedStatistics);
     }
 
     @Override
