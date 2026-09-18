@@ -187,11 +187,12 @@ public class IcebergHiveMetadata
             ManifestFileCache manifestFileCache,
             IcebergTableProperties tableProperties,
             ConnectorSystemConfig connectorSystemConfig,
+            IcebergPageSourceProvider pageSourceProvider,
             IsolationLevel isolationLevel,
             boolean autoCommitContext)
     {
         super(typeManager, procedureRegistry, functionResolution, rowExpressionService, commitTaskCodec, columnMappingsCodec, schemaTableNamesCodec,
-                nodeVersion, filterStatsCalculatorService, statisticsFileCache, tableProperties, isolationLevel, autoCommitContext);
+                nodeVersion, filterStatsCalculatorService, statisticsFileCache, tableProperties, pageSourceProvider, isolationLevel, autoCommitContext);
         this.catalogName = requireNonNull(catalogName, "catalogName is null");
         this.metastore = requireNonNull(metastore, "metastore is null");
         this.hdfsEnvironment = requireNonNull(hdfsEnvironment, "hdfsEnvironment is null");

@@ -14,6 +14,7 @@
 package com.facebook.presto.metadata;
 
 import com.facebook.presto.connector.informationSchema.InformationSchemaHandleResolver;
+import com.facebook.presto.connector.system.Changes;
 import com.facebook.presto.connector.system.SystemHandleResolver;
 import com.facebook.presto.operator.table.ExcludeColumns;
 import com.facebook.presto.operator.table.Sequence;
@@ -75,12 +76,13 @@ public class HandleResolver
                 "$system",
                 new MaterializedResolver<>(() -> ImmutableSet.of(
                         ExcludeColumns.ExcludeColumnsFunctionHandle.class,
+                        Changes.ChangesFunctionHandle.class,
                         Sequence.SequenceFunctionHandle.class)));
 
         tableFunctionSplitResolvers.put(
                 "$system",
                 new MaterializedResolver<>(() ->
-                        ImmutableSet.of(Sequence.SequenceFunctionSplit.class)));
+                        ImmutableSet.of(Changes.ChangesFunctionSplit.class, Sequence.SequenceFunctionSplit.class)));
     }
 
     public void addConnectorName(String name, ConnectorHandleResolver resolver)

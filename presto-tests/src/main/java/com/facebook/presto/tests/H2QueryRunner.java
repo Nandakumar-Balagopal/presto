@@ -23,6 +23,7 @@ import com.facebook.presto.common.type.RowType;
 import com.facebook.presto.common.type.TimestampType;
 import com.facebook.presto.common.type.Type;
 import com.facebook.presto.common.type.TypeWithName;
+import com.facebook.presto.common.type.VarcharEnumType;
 import com.facebook.presto.common.type.VarcharType;
 import com.facebook.presto.spi.ColumnMetadata;
 import com.facebook.presto.spi.ConnectorTableMetadata;
@@ -360,6 +361,12 @@ public class H2QueryRunner
                 }
                 else if (type instanceof DistinctType) {
                     return getValue(((DistinctType) type).getBaseType(), resultSet, position);
+                }
+                else if (type instanceof VarcharEnumType) {
+                    // The expected side is a plain H2 string column; TestingPrestoClient already
+                    // reads the actual side of a varchar enum the same way.
+                    String stringValue = resultSet.getString(position);
+                    return resultSet.wasNull() ? null : stringValue;
                 }
                 else {
                     throw new AssertionError("unhandled type: " + type);
