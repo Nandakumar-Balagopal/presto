@@ -17,6 +17,7 @@ import com.facebook.presto.common.CatalogSchemaName;
 import com.facebook.presto.common.QualifiedObjectName;
 import com.facebook.presto.common.predicate.TupleDomain;
 import com.facebook.presto.common.type.Type;
+import com.facebook.presto.spi.ChangeKindPageSource;
 import com.facebook.presto.spi.ColumnHandle;
 import com.facebook.presto.spi.ColumnMetadata;
 import com.facebook.presto.spi.ConnectorDeleteTableHandle;
@@ -25,6 +26,7 @@ import com.facebook.presto.spi.ConnectorInsertTableHandle;
 import com.facebook.presto.spi.ConnectorMergeTableHandle;
 import com.facebook.presto.spi.ConnectorNewTableLayout;
 import com.facebook.presto.spi.ConnectorOutputTableHandle;
+import com.facebook.presto.spi.ConnectorRefreshMaterializedViewHandle;
 import com.facebook.presto.spi.ConnectorResolvedIndex;
 import com.facebook.presto.spi.ConnectorSession;
 import com.facebook.presto.spi.ConnectorTableHandle;
@@ -837,6 +839,72 @@ public interface ConnectorMetadata
     }
 
     /**
+     * Returns whether the connector can atomically remove and replace affected MV rows/groups.
+     * Connectors must opt in before the engine enables row-level MV refresh planning.
+     */
+    default boolean supportsMaterializedViewRowLevelRefresh(ConnectorSession session, ConnectorTableHandle materializedViewTable)
+    {
+        return false;
+    }
+
+    /**
+     * Returns the version embedded in a table handle when the connector supports row-level change tracking.
+     *
+     * <p>A non-empty return is the connector's declaration that it tracks row-level change. The
+     * version is opaque to the engine, which only round-trips it through materialized view metadata
+     * and hands it back as the {@code from} or {@code to} bound of {@link #getChangeSet}.
+     *
+     * <p>See {@link #getChangeSet} for the obligations that come with declaring the capability.
+     */
+    default Optional<ConnectorTableVersion> getCurrentTableVersion(ConnectorSession session, ConnectorTableHandle table)
+    {
+        return Optional.empty();
+    }
+
+    /**
+     * Returns changes between two table versions. Connectors must return pre-change values for DELETE and UPDATE_BEFORE rows.
+     *
+     * <p>Implementing this method without throwing commits the connector to the whole of row-level
+     * change tracking, because the engine cannot build a correct plan from a subset of it. A
+     * connector that overrides this method MUST also:
+     *
+     * <ul>
+     *   <li>return non-empty from {@link #getCurrentTableVersion} for the same table, since the
+     *       change set is only meaningful over a version range the engine can name;</li>
+     *   <li>populate {@code MaterializedViewStatus.recordedBaseTableHandles} with a handle pinned at
+     *       the recorded version of every base table of a materialized view, which is where the
+     *       {@code from} bound comes from; and</li>
+     *   <li>populate {@code MaterializedViewStatus.changedRowsPredicates} for those same base
+     *       tables, so the engine can identify changed rows without reading the change set.</li>
+     * </ul>
+     *
+     * <p>The engine declines row-level refresh rather than risking a wrong answer when it finds the
+     * predicates populated without the matching pinned handles.
+     */
+    default ChangeKindPageSource getChangeSet(
+            ConnectorSession session,
+            ConnectorTableHandle table,
+            ConnectorTableVersion from,
+            ConnectorTableVersion to,
+            List<ColumnHandle> projectedDataColumns,
+            TupleDomain<ColumnHandle> filter)
+    {
+        throw new UnsupportedOperationException("This connector does not support row-level change tracking");
+    }
+
+    /**
+     * Returns the expected number of rows in the change set, if it is available without scanning table data.
+     */
+    default OptionalLong estimateChangeSetSize(
+            ConnectorSession session,
+            ConnectorTableHandle table,
+            ConnectorTableVersion from,
+            ConnectorTableVersion to)
+    {
+        return OptionalLong.empty();
+    }
+
+    /**
      * Begin refresh materialized view
      */
     default ConnectorInsertTableHandle beginRefreshMaterializedView(ConnectorSession session, ConnectorTableHandle tableHandle)
@@ -860,6 +928,27 @@ public interface ConnectorMetadata
     default Optional<ConnectorOutputMetadata> finishRefreshMaterializedView(ConnectorSession session, ConnectorInsertTableHandle insertHandle, Collection<Slice> fragments, Collection<ComputedStatistics> computedStatistics)
     {
         throw new PrestoException(GENERIC_INTERNAL_ERROR, "ConnectorMetadata finishRefreshMaterializedView() is not implemented");
+    }
+
+    /**
+     * Finish a refresh using a connector refresh handle.  The default preserves
+     * compatibility with connectors that only implement insert refreshes.
+     */
+    default Optional<ConnectorOutputMetadata> finishRefreshMaterializedView(ConnectorSession session, ConnectorRefreshMaterializedViewHandle refreshHandle, Collection<Slice> fragments, Collection<ComputedStatistics> computedStatistics)
+    {
+        return finishRefreshMaterializedView(session, (ConnectorInsertTableHandle) refreshHandle, fragments, computedStatistics);
+    }
+
+    /**
+     * Finish a refresh with separate delete and insert commit fragments.  The
+     * default rejects delete fragments so they can never be silently ignored.
+     */
+    default Optional<ConnectorOutputMetadata> finishRefreshMaterializedView(ConnectorSession session, ConnectorRefreshMaterializedViewHandle refreshHandle, Collection<Slice> deleteFragments, Collection<Slice> insertFragments, Collection<ComputedStatistics> computedStatistics)
+    {
+        if (!deleteFragments.isEmpty()) {
+            throw new PrestoException(NOT_SUPPORTED, "Connector does not support atomic delete and insert materialized view refresh");
+        }
+        return finishRefreshMaterializedView(session, refreshHandle, insertFragments, computedStatistics);
     }
 
     /**
