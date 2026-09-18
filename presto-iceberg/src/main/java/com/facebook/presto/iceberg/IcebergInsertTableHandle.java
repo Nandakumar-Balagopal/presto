@@ -14,7 +14,8 @@
 package com.facebook.presto.iceberg;
 
 import com.facebook.presto.hive.HiveCompressionCodec;
-import com.facebook.presto.spi.ConnectorInsertTableHandle;
+import com.facebook.presto.spi.ConnectorDeleteTableHandle;
+import com.facebook.presto.spi.ConnectorRefreshMaterializedViewHandle;
 import com.facebook.presto.spi.SchemaTableName;
 import com.fasterxml.jackson.annotation.JsonCreator;
 import com.fasterxml.jackson.annotation.JsonProperty;
@@ -28,9 +29,10 @@ import static java.util.Objects.requireNonNull;
 
 public class IcebergInsertTableHandle
         extends IcebergWritableTableHandle
-        implements ConnectorInsertTableHandle
+        implements ConnectorRefreshMaterializedViewHandle
 {
     private final List<String> insertedColumns;
+    private final Optional<ConnectorDeleteTableHandle> affectedRowsDeleteHandle;
 
     public IcebergInsertTableHandle(
             String schemaName,
@@ -85,6 +87,26 @@ public class IcebergInsertTableHandle
                 fileFormat, compressionCodec, storageProperties, sortOrder, materializedViewName, fullRefreshRequired, List.of());
     }
 
+    public IcebergInsertTableHandle(
+            String schemaName,
+            IcebergTableName tableName,
+            PrestoIcebergSchema schema,
+            PrestoIcebergPartitionSpec partitionSpec,
+            List<IcebergColumnHandle> inputColumns,
+            String outputPath,
+            FileFormat fileFormat,
+            HiveCompressionCodec compressionCodec,
+            Map<String, String> storageProperties,
+            List<SortField> sortOrder,
+            Optional<SchemaTableName> materializedViewName,
+            boolean fullRefreshRequired,
+            List<String> insertedColumns)
+    {
+        this(schemaName, tableName, schema, partitionSpec, inputColumns, outputPath,
+                fileFormat, compressionCodec, storageProperties, sortOrder, materializedViewName,
+                fullRefreshRequired, insertedColumns, Optional.empty());
+    }
+
     @JsonCreator
     public IcebergInsertTableHandle(
             @JsonProperty("schemaName") String schemaName,
@@ -99,7 +121,8 @@ public class IcebergInsertTableHandle
             @JsonProperty("sortOrder") List<SortField> sortOrder,
             @JsonProperty("materializedViewName") Optional<SchemaTableName> materializedViewName,
             @JsonProperty("fullRefreshRequired") boolean fullRefreshRequired,
-            @JsonProperty("insertedColumns") List<String> insertedColumns)
+            @JsonProperty("insertedColumns") List<String> insertedColumns,
+            @JsonProperty("affectedRowsDeleteHandle") Optional<ConnectorDeleteTableHandle> affectedRowsDeleteHandle)
     {
         super(
                 schemaName,
@@ -115,11 +138,19 @@ public class IcebergInsertTableHandle
                 materializedViewName,
                 fullRefreshRequired);
         this.insertedColumns = ImmutableList.copyOf(requireNonNull(insertedColumns, "insertedColumns is null"));
+        this.affectedRowsDeleteHandle = requireNonNull(affectedRowsDeleteHandle, "affectedRowsDeleteHandle is null");
     }
 
     @JsonProperty
     public List<String> getInsertedColumns()
     {
         return insertedColumns;
+    }
+
+    @Override
+    @JsonProperty
+    public Optional<ConnectorDeleteTableHandle> getAffectedRowsDeleteHandle()
+    {
+        return affectedRowsDeleteHandle;
     }
 }
