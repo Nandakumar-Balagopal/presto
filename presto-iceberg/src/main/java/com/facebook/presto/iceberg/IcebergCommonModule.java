@@ -164,6 +164,7 @@ public class IcebergCommonModule
 
         binder.bind(ConnectorSplitManager.class).to(IcebergSplitManager.class).in(Scopes.SINGLETON);
         newExporter(binder).export(ConnectorSplitManager.class).as(generatedNameOf(IcebergSplitManager.class, connectorId));
+        binder.bind(IcebergPageSourceProvider.class).in(Scopes.SINGLETON);
         binder.bind(ConnectorPageSourceProvider.class).to(IcebergPageSourceProvider.class).in(Scopes.SINGLETON);
         binder.bind(DataSinkFactory.class).to(OutputStreamDataSinkFactory.class).in(Scopes.SINGLETON);
         binder.bind(OrcFileWriterFactory.class).in(Scopes.SINGLETON);
