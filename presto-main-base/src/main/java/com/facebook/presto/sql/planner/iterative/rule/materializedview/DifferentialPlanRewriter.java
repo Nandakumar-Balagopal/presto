@@ -366,7 +366,8 @@ public class DifferentialPlanRewriter
             if (!isRowLevel(entry.getValue())) {
                 continue;
             }
-            if (entry.getValue().isAdditionsOnly() && isRowPreserving(node.getViewQueryPlan(), lookup)) {
+            if (entry.getValue().isAdditionsOnly()
+                    && classifyViewShape(node.getViewQueryPlan(), lookup) == ViewShape.ROW_PRESERVING) {
                 // One output row per base row, and the range only added base rows: nothing already
                 // in storage can have become stale, and the added rows are not in storage yet, so
                 // the fresh branch keeps everything and the delta supplies the rest. Excluding
@@ -562,19 +563,27 @@ public class DifferentialPlanRewriter
             PassthroughColumnEquivalences columnEquivalences,
             Lookup lookup)
     {
-        if (!searchFrom(viewQueryPlan, lookup).where(JoinNode.class::isInstance).findAll().isEmpty()) {
-            throw new UnsupportedOperationException("row-level refresh of a materialized view with a join is not supported yet");
+        ViewShape shape = classifyViewShape(viewQueryPlan, lookup);
+        if (shape == ViewShape.ROW_PRESERVING) {
+            // Reachable only when the change range is not additions only, since the additions-only
+            // case needs no exclusion and never asks for identifiers. Excluding a modified row's
+            // materialized row needs the origin identity the storage table does not carry.
+            throw new UnsupportedOperationException(
+                    "row-level refresh of a row-preserving materialized view requires row-origin storage, which is not implemented yet");
+        }
+        if (shape == ViewShape.UNSUPPORTED) {
+            throw new UnsupportedOperationException(
+                    "row-level refresh of this materialized view shape is not supported yet: a join needs composite origin identity, " +
+                            "and nested grouping aggregations leave the materialized row's identity ambiguous");
         }
 
         AggregationNode aggregation = searchFrom(viewQueryPlan, lookup)
-                .where(AggregationNode.class::isInstance)
+                .where(node -> node instanceof AggregationNode && !((AggregationNode) node).getGroupingKeys().isEmpty())
                 .findAll()
                 .stream()
                 .map(AggregationNode.class::cast)
-                .filter(node -> !node.getGroupingKeys().isEmpty())
                 .findFirst()
-                .orElseThrow(() -> new UnsupportedOperationException(
-                        "row-level refresh of a row-preserving materialized view requires row-origin storage, which is not implemented yet"));
+                .orElseThrow(() -> new IllegalStateException("classifyViewShape reported AGGREGATING with no grouping aggregation"));
 
         Map<VariableReferenceExpression, TableColumn> baseColumnByVariable =
                 resolveBaseColumnsByVariable(metadata, session, viewQueryPlan, lookup);
@@ -863,23 +872,42 @@ public class DifferentialPlanRewriter
     }
 
     /**
-     * Whether the view produces one output row per base row, so that a materialized row's validity
-     * depends on a single base row rather than on a set of them.
+     * What identifies a materialized row, which decides how the fresh branch excludes the rows the
+     * delta is going to recompute.
      *
-     * <p>A grouping aggregation makes a row depend on every row of its group, and a join makes it
-     * depend on a row from each side; in both cases adding a base row invalidates something already
-     * materialized. Declining for joins also keeps this aligned with the deferral of row-preserving
-     * views over joins, which need per-base origin identity to exclude correctly.
+     * <p>Answered in one place because three callers need it and each used to ask separately: the
+     * refresh safety check, the identifier resolution that drives the anti-join, and the
+     * pass-through for views that need no exclusion. Any disagreement between them is a wrong plan
+     * rather than a slower one.
      */
-    private static boolean isRowPreserving(PlanNode viewQueryPlan, Lookup lookup)
+    enum ViewShape
+    {
+        /** One output row per group; the grouping keys identify it. */
+        AGGREGATING,
+        /** One output row per base row; the base row's identity identifies it. */
+        ROW_PRESERVING,
+        /** Row identity is not expressible, so row-level cannot exclude correctly. */
+        UNSUPPORTED,
+    }
+
+    /**
+     * A join makes an output row depend on a row from each side, so identifying it needs a
+     * composite origin the storage table does not carry; such a view stays partition-level. More
+     * than one grouping aggregation leaves the identity ambiguous -- which level's keys name the
+     * row -- so it is not claimed either.
+     */
+    static ViewShape classifyViewShape(PlanNode viewQueryPlan, Lookup lookup)
     {
         if (!searchFrom(viewQueryPlan, lookup).where(JoinNode.class::isInstance).findAll().isEmpty()) {
-            return false;
+            return ViewShape.UNSUPPORTED;
         }
-        return searchFrom(viewQueryPlan, lookup)
+        List<PlanNode> groupingAggregations = searchFrom(viewQueryPlan, lookup)
                 .where(node -> node instanceof AggregationNode && !((AggregationNode) node).getGroupingKeys().isEmpty())
-                .findAll()
-                .isEmpty();
+                .findAll();
+        if (groupingAggregations.isEmpty()) {
+            return ViewShape.ROW_PRESERVING;
+        }
+        return groupingAggregations.size() == 1 ? ViewShape.AGGREGATING : ViewShape.UNSUPPORTED;
     }
 
     /**
@@ -908,16 +936,16 @@ public class DifferentialPlanRewriter
         if (storagePartitionColumns.isEmpty()) {
             return false;
         }
-        if (!searchFrom(viewQueryPlan, lookup).where(JoinNode.class::isInstance).findAll().isEmpty()) {
+        // Only an aggregating view can have its groups replaced: the storage partitions are the
+        // groups. A row-preserving view would need rows replaced individually, which the refresh
+        // commit cannot express.
+        if (classifyViewShape(viewQueryPlan, lookup) != ViewShape.AGGREGATING) {
             return false;
         }
 
         List<PlanNode> aggregations = searchFrom(viewQueryPlan, lookup)
                 .where(node -> node instanceof AggregationNode && !((AggregationNode) node).getGroupingKeys().isEmpty())
                 .findAll();
-        if (aggregations.size() != 1) {
-            return false;
-        }
 
         Map<VariableReferenceExpression, TableColumn> baseColumns =
                 resolveBaseColumnsByVariable(metadata, session, viewQueryPlan, lookup);
