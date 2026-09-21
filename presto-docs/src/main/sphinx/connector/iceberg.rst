@@ -684,6 +684,25 @@ Session properties set behavior changes for queries executed within the given se
          falls back to row-count comparison when stats are unknown.
      - Yes
      - Yes
+   * - .. _iceberg-sess-materialized-view-row-level-incremental-strategy:
+
+       ``materialized_view_row_level_incremental_strategy``
+     - Controls when a refresh or a stitched read recomputes only the rows the connector
+       reports as changed, rather than whole stale partitions. Requires an Iceberg V3 base
+       table with row lineage; a V2 base has no durable row identity and falls back to
+       partition-level with no configuration.
+
+       - ``NEVER`` (default): never use row-level.
+       - ``ALWAYS``: use row-level whenever it is eligible.
+       - ``AUTOMATIC``: the cost-based optimizer chooses among row-level, partition-level
+         and full recompute. When row-level is eligible and another plan costs less, a
+         ``MATERIALIZED_VIEW_ROW_LEVEL_REJECTED_ON_COST`` warning reports the choice.
+
+       A view may opt out regardless of this property with
+       :ref:`row_level_incremental_refresh <mv-prop-row-level-incremental-refresh>`, and
+       ``NEVER`` here suppresses row-level regardless of the view.
+     - Yes
+     - Yes
    * - .. _iceberg-sess-max-partitions-per-writer:
 
        ``max_partitions_per_writer``
@@ -3168,6 +3187,18 @@ by using :doc:`/sql/alter-materialized-view`; properties not specified in the
        VIEW``. ``0`` means unbounded. Defaults to the
        ``materialized_view_default_max_snapshots_per_refresh`` session property.
        Requires Iceberg V3 row lineage; V2 tables fall back to unbounded refresh.
+     - Yes
+   * - .. _mv-prop-row-level-incremental-refresh:
+
+       ``row_level_incremental_refresh``
+     - Whether this view may recompute only the rows the connector reports as changed.
+       When unset, the
+       :ref:`materialized_view_row_level_incremental_strategy
+       <iceberg-sess-materialized-view-row-level-incremental-strategy>` session property
+       decides. Setting ``false`` opts the view out even when the session asks for
+       row-level; a session strategy of ``NEVER`` suppresses row-level even when this is
+       ``true``. Either control can turn row-level off, and both must permit it for it to
+       be considered.
      - Yes
    * - .. _mv-prop-use-timestamp-based-staleness:
 
