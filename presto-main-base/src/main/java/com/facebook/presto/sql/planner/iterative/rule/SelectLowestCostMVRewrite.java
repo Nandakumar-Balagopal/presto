@@ -20,6 +20,7 @@ import com.facebook.presto.cost.PlanCostEstimate;
 import com.facebook.presto.cost.StatsProvider;
 import com.facebook.presto.matching.Captures;
 import com.facebook.presto.matching.Pattern;
+import com.facebook.presto.spi.PrestoWarning;
 import com.facebook.presto.spi.plan.Assignments;
 import com.facebook.presto.spi.plan.MVRewriteCandidatesNode;
 import com.facebook.presto.spi.plan.MVRewriteCandidatesNode.MVRewriteCandidate;
@@ -35,6 +36,7 @@ import java.util.List;
 import static com.facebook.presto.SystemSessionProperties.getMaterializedViewIncrementalRefreshStrategy;
 import static com.facebook.presto.SystemSessionProperties.getMaterializedViewStitchingStrategy;
 import static com.facebook.presto.SystemSessionProperties.isMaterializedViewQueryRewriteCostBasedSelectionEnabled;
+import static com.facebook.presto.spi.StandardWarningCode.MATERIALIZED_VIEW_ROW_LEVEL_REJECTED_ON_COST;
 import static com.facebook.presto.sql.planner.iterative.rule.materializedview.MaterializedViewRewriteStrategy.AUTOMATIC;
 import static com.facebook.presto.sql.planner.plan.Patterns.mvRewriteCandidates;
 import static com.google.common.base.Preconditions.checkArgument;
@@ -87,6 +89,9 @@ public class SelectLowestCostMVRewrite
 
         PlanNode selectedPlan = node.getOriginalPlan();
         PlanCostEstimate lowestCost = costProvider.getCost(selectedPlan);
+        // Null while the original plan is still winning, i.e. no candidate has beaten a full
+        // recompute yet.
+        MVRewriteCandidate selectedCandidate = null;
 
         for (MVRewriteCandidate candidate : node.getCandidates()) {
             PlanCostEstimate candidateCost = costProvider.getCost(candidate.getPlan());
@@ -95,6 +100,7 @@ public class SelectLowestCostMVRewrite
                 if (costComparator.compare(session, candidateCost, lowestCost) < 0) {
                     lowestCost = candidateCost;
                     selectedPlan = candidate.getPlan();
+                    selectedCandidate = candidate;
                 }
             }
             else {
@@ -104,8 +110,25 @@ public class SelectLowestCostMVRewrite
                 if (!Double.isNaN(candidateRows) && (Double.isNaN(selectedRows) || candidateRows < selectedRows)) {
                     lowestCost = candidateCost;
                     selectedPlan = candidate.getPlan();
+                    selectedCandidate = candidate;
                 }
             }
+        }
+
+        // A row-level candidate that was offered and not chosen is the cost picker working, not a
+        // capability gap, so it gets its own code: without one, a view that never refreshes
+        // row-level looks the same whether it was ineligible or merely more expensive.
+        boolean rowLevelOffered = node.getCandidates().stream().anyMatch(MVRewriteCandidate::isRowLevel);
+        if (rowLevelOffered && (selectedCandidate == null || !selectedCandidate.isRowLevel())) {
+            context.getWarningCollector().add(new PrestoWarning(
+                    MATERIALIZED_VIEW_ROW_LEVEL_REJECTED_ON_COST,
+                    "Row-level incremental refresh was available for materialized view " +
+                            node.getCandidates().stream()
+                                    .filter(MVRewriteCandidate::isRowLevel)
+                                    .map(MVRewriteCandidate::getFullyQualifiedName)
+                                    .findFirst()
+                                    .orElse("<unknown>") +
+                            " and was not chosen because another plan cost less."));
         }
 
         // Resolve GroupReference since Memo wraps children as GroupReferences

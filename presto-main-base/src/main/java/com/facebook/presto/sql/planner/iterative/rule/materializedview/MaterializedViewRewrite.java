@@ -177,7 +177,7 @@ public class MaterializedViewRewrite
 
                 if (!candidates.isEmpty()) {
                     if (stitchingStrategy == MaterializedViewRewriteStrategy.AUTOMATIC) {
-                        return Result.ofPlanNode(buildAutomaticCandidates(node, candidates, idAllocator));
+                        return Result.ofPlanNode(buildAutomaticCandidates(node, candidates, rowLevelPlan, idAllocator));
                     }
                     return Result.ofPlanNode(candidates.get(0));
                 }
@@ -313,7 +313,11 @@ public class MaterializedViewRewrite
         }
     }
 
-    private PlanNode buildAutomaticCandidates(MaterializedViewScanNode node, List<PlanNode> stitchedPlans, PlanNodeIdAllocator idAllocator)
+    private PlanNode buildAutomaticCandidates(
+            MaterializedViewScanNode node,
+            List<PlanNode> stitchedPlans,
+            Optional<PlanNode> rowLevelPlan,
+            PlanNodeIdAllocator idAllocator)
     {
         PlanNode projectedViewQuery = projectToOutputs(node, node.getViewQueryPlan(), node.getViewQueryMappings(), idAllocator);
         QualifiedObjectName mvName = node.getMaterializedViewName();
@@ -326,7 +330,10 @@ public class MaterializedViewRewrite
                                 plan,
                                 mvName.getCatalogName(),
                                 mvName.getSchemaName(),
-                                mvName.getObjectName()))
+                                mvName.getObjectName(),
+                                // Identity, not equality: this is the same instance the row-level
+                                // builder returned and that was added to stitchedPlans.
+                                rowLevelPlan.map(rowLevel -> rowLevel == plan).orElse(false)))
                         .collect(toImmutableList()),
                 node.getOutputVariables());
     }

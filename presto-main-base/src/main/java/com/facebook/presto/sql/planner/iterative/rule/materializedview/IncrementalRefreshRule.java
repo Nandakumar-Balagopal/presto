@@ -291,7 +291,10 @@ public class IncrementalRefreshRule
                             deltaWithPredicates,
                             catalogName,
                             materializedViewName.getSchemaName(),
-                            materializedViewName.getTableName())),
+                            materializedViewName.getTableName(),
+                            // The delta recomputes only changed groups exactly when the connector
+                            // supplied changed-rows predicates and they survived the safety checks.
+                            !rowLevelPredicates.isEmpty())),
                     node.getOutputVariables()));
         }
 
