@@ -2452,7 +2452,11 @@ public abstract class IcebergAbstractMetadata
                             ImmutableList.of(TupleDomain.withColumnDomains(ImmutableMap.of(
                                     LAST_UPDATED_SEQUENCE_NUMBER_COLUMN_HANDLE,
                                     Domain.create(ValueSet.ofRanges(Range.greaterThan(BigintType.BIGINT, recordedSnapshot.sequenceNumber())), false)))),
-                            refreshBound));
+                            refreshBound,
+                            // Every snapshot in the range was checked to be an APPEND above, which
+                            // adds data files and removes none, so nothing present at the recorded
+                            // version was modified or removed.
+                            true));
                 }
             }
 

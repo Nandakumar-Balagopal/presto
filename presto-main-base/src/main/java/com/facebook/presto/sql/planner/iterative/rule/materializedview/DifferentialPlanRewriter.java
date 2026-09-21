@@ -366,6 +366,18 @@ public class DifferentialPlanRewriter
             if (!isRowLevel(entry.getValue())) {
                 continue;
             }
+            if (entry.getValue().isAdditionsOnly() && isRowPreserving(node.getViewQueryPlan(), lookup)) {
+                // One output row per base row, and the range only added base rows: nothing already
+                // in storage can have become stale, and the added rows are not in storage yet, so
+                // the fresh branch keeps everything and the delta supplies the rest. Excluding
+                // anything here would drop rows the delta does not recompute.
+                //
+                // Both halves are load-bearing. Without additionsOnly a modified base row would
+                // still match the disjuncts while its materialized row sat unchanged in storage.
+                // Without row-preserving, a group's total would be recomputed by the delta and
+                // double-counted against the row still in storage.
+                continue;
+            }
             freshPlan = antiJoinAffectedIdentifiers(
                     metadata,
                     session,
@@ -848,6 +860,26 @@ public class DifferentialPlanRewriter
             }
         });
         return renames.buildKeepingLast();
+    }
+
+    /**
+     * Whether the view produces one output row per base row, so that a materialized row's validity
+     * depends on a single base row rather than on a set of them.
+     *
+     * <p>A grouping aggregation makes a row depend on every row of its group, and a join makes it
+     * depend on a row from each side; in both cases adding a base row invalidates something already
+     * materialized. Declining for joins also keeps this aligned with the deferral of row-preserving
+     * views over joins, which need per-base origin identity to exclude correctly.
+     */
+    private static boolean isRowPreserving(PlanNode viewQueryPlan, Lookup lookup)
+    {
+        if (!searchFrom(viewQueryPlan, lookup).where(JoinNode.class::isInstance).findAll().isEmpty()) {
+            return false;
+        }
+        return searchFrom(viewQueryPlan, lookup)
+                .where(node -> node instanceof AggregationNode && !((AggregationNode) node).getGroupingKeys().isEmpty())
+                .findAll()
+                .isEmpty();
     }
 
     /**

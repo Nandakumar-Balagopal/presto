@@ -209,6 +209,55 @@ public class TestIcebergRowLevelStitching
                 .build();
     }
 
+    /**
+     * A view that only projects and filters has one output row per base row, so when the change
+     * range only added rows there is nothing for the fresh branch to exclude: an addition cannot
+     * invalidate a row already in storage, and the added rows are not in storage yet. The stitched
+     * read is the storage table unioned with the projected delta, needing neither an anti-join nor
+     * a row-origin column.
+     */
+    @Test
+    public void testRowLevelStitchingOverProjectionOnlyView()
+    {
+        String base = "rlsp_base";
+        String view = "rlsp_mv";
+        try {
+            assertQuerySucceeds("CREATE TABLE " + base + " (region varchar, amount bigint) "
+                    + "WITH (\"format-version\" = '3')");
+            assertQuerySucceeds("INSERT INTO " + base + " VALUES ('NA', 10), ('EU', 20), ('NA', 2)");
+
+            assertQuerySucceeds("CREATE MATERIALIZED VIEW " + view
+                    + " AS SELECT region, amount FROM " + base + " WHERE amount > 5");
+            assertQuerySucceeds("REFRESH MATERIALIZED VIEW " + view);
+
+            // Additions only: one row passing the view filter, one failing it.
+            assertQuerySucceeds("INSERT INTO " + base + " VALUES ('APAC', 7), ('NA', 1)");
+
+            assertQuery(
+                    stitching("ALWAYS"),
+                    "SELECT region, amount FROM " + view + " ORDER BY region, amount",
+                    "VALUES ('APAC', 7), ('EU', 20), ('NA', 10)");
+
+            String plan = explainProjectionView(stitching("ALWAYS"), view);
+            assertTrue(plan.contains("_last_updated_sequence_number"),
+                    "expected the row-level changed-rows predicate at the base scan, got:\n" + plan);
+            assertFalse(plan.contains("IS_NULL(affected)"),
+                    "an additions-only projection view needs no anti-join over the storage table, got:\n" + plan);
+        }
+        finally {
+            assertQuerySucceeds("DROP MATERIALIZED VIEW IF EXISTS " + view);
+            assertQuerySucceeds("DROP TABLE IF EXISTS " + base);
+        }
+    }
+
+    private String explainProjectionView(Session session, String view)
+    {
+        MaterializedResult result = computeActual(session,
+                "EXPLAIN (TYPE LOGICAL) SELECT region, amount FROM " + view + " ORDER BY region, amount");
+        assertEquals(result.getMaterializedRows().size(), 1);
+        return (String) result.getMaterializedRows().get(0).getField(0);
+    }
+
     private String explainView(Session session, String view)
     {
         MaterializedResult result = computeActual(session,
