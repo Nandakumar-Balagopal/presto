@@ -660,6 +660,114 @@ public class TestIcebergRowLevelRefreshEdgeCases
         }
     }
 
+    /**
+     * A group that lost every one of its rows must disappear from a stale read.
+     * <p>
+     * This is the case the removed-rows branch exists for, and the one that is silently wrong
+     * without it. A changed-rows predicate selects rows of the base as it stands, so a row that was
+     * removed is not there to be selected: the group is excluded from the fresh branch as unchanged
+     * and has nothing to recompute it from, so its old total survives. The removed rows have to be
+     * read from somewhere else, and the connector says where.
+     */
+    @Test
+    public void testStaleReadAfterAGroupIsEmptied()
+    {
+        String base = "emptied_base";
+        String view = "emptied_mv";
+        try {
+            // Unpartitioned V3, which is the shape that reaches the row-level path for a range
+            // containing a removal.
+            assertQuerySucceeds("CREATE TABLE " + base + " (region varchar, amount bigint) WITH (\"format-version\" = '3')");
+            assertQuerySucceeds("INSERT INTO " + base + " VALUES ('NA', 10), ('EU', 20), ('APAC', 5)");
+            assertQuerySucceeds("CREATE MATERIALIZED VIEW " + view
+                    + " WITH (refresh_type = 'INCREMENTAL')"
+                    + " AS SELECT region, SUM(amount) AS total FROM " + base + " GROUP BY region");
+            refreshExpectingFallback(view);
+            assertViewMatchesBase(
+                    "SELECT region, total FROM " + view + " ORDER BY region",
+                    "SELECT region, SUM(amount) FROM " + base + " GROUP BY region ORDER BY region");
+
+            // A whole-table DELETE is the only removal a V3 table accepts through SQL today:
+            // beginDelete refuses a row-level delete above format version 2. Re-inserting a subset
+            // afterwards leaves EU genuinely gone while NA is back, which is the shape that matters
+            // -- a group the view still holds a total for, with no rows left behind it.
+            assertQuerySucceeds("DELETE FROM " + base);
+            assertQuerySucceeds("INSERT INTO " + base + " VALUES ('NA', 10), ('APAC', 5)");
+
+            assertEquals(
+                    computeActual(stitchSession(), "SELECT region, total FROM " + view + " ORDER BY region").getMaterializedRows(),
+                    computeActual("SELECT region, SUM(amount) FROM " + base + " GROUP BY region ORDER BY region").getMaterializedRows(),
+                    "a group emptied by a delete survived in the stale read");
+        }
+        finally {
+            drop(view, base);
+        }
+    }
+
+    /**
+     * A removal and an append in one range: the emptied group goes and the appended one is
+     * recomputed, from the same stale read.
+     */
+    @Test
+    public void testStaleReadOverRemovalAndAppend()
+    {
+        String base = "mixed_base";
+        String view = "mixed_mv";
+        try {
+            assertQuerySucceeds("CREATE TABLE " + base + " (region varchar, amount bigint) WITH (\"format-version\" = '3')");
+            assertQuerySucceeds("INSERT INTO " + base + " VALUES ('NA', 10), ('EU', 20)");
+            assertQuerySucceeds("CREATE MATERIALIZED VIEW " + view
+                    + " WITH (refresh_type = 'INCREMENTAL')"
+                    + " AS SELECT region, SUM(amount) AS total FROM " + base + " GROUP BY region");
+            refreshExpectingFallback(view);
+
+            assertQuerySucceeds("DELETE FROM " + base);
+            assertQuerySucceeds("INSERT INTO " + base + " VALUES ('NA', 1), ('APAC', 7)");
+
+            assertEquals(
+                    computeActual(stitchSession(), "SELECT region, total FROM " + view + " ORDER BY region").getMaterializedRows(),
+                    computeActual("SELECT region, SUM(amount) FROM " + base + " GROUP BY region ORDER BY region").getMaterializedRows(),
+                    "stale read over a removal plus an append disagrees with the base");
+        }
+        finally {
+            drop(view, base);
+        }
+    }
+
+    /**
+     * Refresh still declines for a range that removed rows, even though a stale read now serves it.
+     * <p>
+     * A read commits nothing, so it may recompute whatever it likes. The refresh commit replaces
+     * the partitions of the files it writes, which can correct a group and add one but cannot take
+     * one away -- so an emptied group would survive the commit with its old value while the
+     * watermark advanced past the delete that should have removed it.
+     */
+    @Test
+    public void testRefreshAfterAGroupIsEmptiedDeclinesRowLevel()
+    {
+        String base = "emptied_ref_base";
+        String view = "emptied_ref_mv";
+        try {
+            assertQuerySucceeds("CREATE TABLE " + base + " (region varchar, amount bigint) WITH (\"format-version\" = '3')");
+            assertQuerySucceeds("INSERT INTO " + base + " VALUES ('NA', 10), ('EU', 20)");
+            assertQuerySucceeds("CREATE MATERIALIZED VIEW " + view
+                    + " WITH (refresh_type = 'INCREMENTAL')"
+                    + " AS SELECT region, SUM(amount) AS total FROM " + base + " GROUP BY region");
+            refreshExpectingFallback(view);
+
+            assertQuerySucceeds("DELETE FROM " + base);
+            assertQuerySucceeds("INSERT INTO " + base + " VALUES ('NA', 10)");
+
+            refreshExpectingFallback(view);
+            assertViewMatchesBase(
+                    "SELECT region, total FROM " + view + " ORDER BY region",
+                    "SELECT region, SUM(amount) FROM " + base + " GROUP BY region ORDER BY region");
+        }
+        finally {
+            drop(view, base);
+        }
+    }
+
     // ------------------------------------------------------------- boilerplate
 
     private void run(

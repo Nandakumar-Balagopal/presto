@@ -251,6 +251,7 @@ import static com.facebook.presto.iceberg.IcebergUtil.getSortFields;
 import static com.facebook.presto.iceberg.IcebergUtil.getTableComment;
 import static com.facebook.presto.iceberg.IcebergUtil.opsFromTable;
 import static com.facebook.presto.iceberg.IcebergUtil.rangeAddsDeleteFiles;
+import static com.facebook.presto.iceberg.IcebergUtil.removalsAreRecoverable;
 import static com.facebook.presto.iceberg.IcebergUtil.resolveSnapshotIdByName;
 import static com.facebook.presto.iceberg.IcebergUtil.supportsRowLineage;
 import static com.facebook.presto.iceberg.IcebergUtil.toHiveColumns;
@@ -278,6 +279,7 @@ import static com.facebook.presto.iceberg.TypeConverter.toIcebergType;
 import static com.facebook.presto.iceberg.TypeConverter.toPrestoType;
 import static com.facebook.presto.iceberg.changelog.ChangelogOperation.UPDATE_AFTER;
 import static com.facebook.presto.iceberg.changelog.ChangelogOperation.UPDATE_BEFORE;
+import static com.facebook.presto.iceberg.changelog.ChangelogUtil.CHANGELOG_ROW_COLUMN_NAME;
 import static com.facebook.presto.iceberg.changelog.ChangelogUtil.getRowTypeFromColumnMeta;
 import static com.facebook.presto.iceberg.optimizer.IcebergPlanOptimizer.getEnforcedColumns;
 import static com.facebook.presto.iceberg.util.StatisticsUtil.calculateBaseTableStatistics;
@@ -1502,6 +1504,30 @@ public abstract class IcebergAbstractMetadata
      * rows, which a predicate over the row-lineage sequence number cannot detect.
      */
     /**
+     * Where the engine can read the rows a range removed: the changelog relation for exactly that
+     * range.
+     * <p>
+     * Resolved here rather than by the engine, and from the same pair of snapshot ids the gate above
+     * just decided on. The engine has no way to address this relation -- how a version range is
+     * named is the connector's business -- and were it to derive the upper bound itself, a commit
+     * landing in between would leave it reading a different range than the one the predicate was
+     * built for, silently missing whatever the gap removed.
+     */
+    private ChangedRowsPredicate.RemovedRows removedRowsSource(
+            ConnectorSession session,
+            SchemaTableName baseTable,
+            long recordedSnapshotId,
+            long currentSnapshotId)
+    {
+        SchemaTableName changelog = new SchemaTableName(
+                baseTable.getSchemaName(),
+                format("%s@%s$changelog@%s", baseTable.getTableName(), recordedSnapshotId, currentSnapshotId));
+        return new ChangedRowsPredicate.RemovedRows(
+                getTableHandle(session, changelog, Optional.empty()),
+                CHANGELOG_ROW_COLUMN_NAME);
+    }
+
+    /**
      * An upper bound on the rows a range reports, read from the manifests without opening a data
      * file: the rows each snapshot added, the rows it dropped with a whole data file, and the
      * positions its delete files mark. A bound rather than a count, because a delete file may mark
@@ -2494,15 +2520,15 @@ public abstract class IcebergAbstractMetadata
             // Row-level change tracking requires a concrete recorded snapshot. A base table
             // with no recorded snapshot continues through the existing partition path.
             //
-            // It also requires the range to contain nothing but appends. The changed-rows predicate
-            // identifies changed rows by their sequence number, which can only find rows that are
-            // still there, so a row removed in the range is invisible to it. A group that lost all
-            // its rows would keep its stale aggregate: the engine excludes it from the fresh branch
-            // and has nothing to recompute it from. Withholding the predicate here leaves such a
-            // range to the partition-level path, which derives changed partitions from metadata and
-            // does see the removals.
+            // The changed-rows predicate identifies changed rows by their sequence number, so it can
+            // only find rows that are still there: a row the range removed is invisible to it. An
+            // append-only range has no removals to miss. Any other range is offered only when the
+            // removals can be read from somewhere else, which is what removedRows carries -- without
+            // it a group that lost all its rows would keep its stale aggregate, excluded from the
+            // fresh branch with nothing to recompute it from.
+            boolean appendOnly = isAppendOnlyRange(baseIcebergTable, recordedSnapshotId, currentSnapshotId);
             if (recordedSnapshotId != 0 && supportsRowLineage(baseIcebergTable)
-                    && isAppendOnlyRange(baseIcebergTable, recordedSnapshotId, currentSnapshotId)) {
+                    && (appendOnly || removalsAreRecoverable(baseIcebergTable, recordedSnapshotId, currentSnapshotId))) {
                 Snapshot recordedSnapshot = baseIcebergTable.snapshot(recordedSnapshotId);
                 if (recordedSnapshot != null) {
                     ConnectorTableVersion recordedVersion = new ConnectorTableVersion(
@@ -2516,10 +2542,11 @@ public abstract class IcebergAbstractMetadata
                                     LAST_UPDATED_SEQUENCE_NUMBER_COLUMN_HANDLE,
                                     Domain.create(ValueSet.ofRanges(Range.greaterThan(BigintType.BIGINT, recordedSnapshot.sequenceNumber())), false)))),
                             refreshBound,
-                            // Every snapshot in the range was checked to be an APPEND above, which
-                            // adds data files and removes none, so nothing present at the recorded
-                            // version was modified or removed.
-                            true));
+                            // An append adds data files and removes none, so on such a range nothing
+                            // present at the recorded version was modified or removed. On any other
+                            // range something was, and the consumer has to account for it.
+                            appendOnly,
+                            appendOnly ? Optional.empty() : Optional.of(removedRowsSource(session, baseTable, recordedSnapshotId, currentSnapshotId))));
                 }
             }
 

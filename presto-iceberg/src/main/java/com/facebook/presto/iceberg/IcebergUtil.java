@@ -1097,6 +1097,36 @@ public final class IcebergUtil
      * Such a range is the one Iceberg's incremental changelog scan refuses to plan, so this is
      * what decides whether the connector has to plan the range itself.
      */
+    /**
+     * Whether every row the range removed can actually be recovered.
+     * <p>
+     * This is the exact complement of what planning such a range refuses. A delete file has to name
+     * the one data file it applies to, since that is where the removed rows still are, and it has
+     * to identify them by position -- an equality delete names values instead, and which rows those
+     * matched cannot be recovered without the data as it then stood. The complement has to be exact
+     * because the refusal happens while enumerating splits, where nothing is left to catch it: the
+     * choice must be made here, before the range is offered, or it becomes a failed query.
+     */
+    public static boolean removalsAreRecoverable(Table table, long fromSnapshotId, long toSnapshotId)
+    {
+        if (toSnapshotId == 0 || fromSnapshotId == toSnapshotId) {
+            return true;
+        }
+        for (Snapshot snapshot : SnapshotUtil.ancestorsBetween(table, toSnapshotId, fromSnapshotId)) {
+            // Mirrors the planner's control flow, which skips a compaction before looking at
+            // anything it added.
+            if (org.apache.iceberg.DataOperations.REPLACE.equals(snapshot.operation())) {
+                continue;
+            }
+            for (DeleteFile delete : snapshot.addedDeleteFiles(table.io())) {
+                if (delete.content() != org.apache.iceberg.FileContent.POSITION_DELETES || delete.referencedDataFile() == null) {
+                    return false;
+                }
+            }
+        }
+        return true;
+    }
+
     public static boolean rangeAddsDeleteFiles(Table table, long fromSnapshotId, long toSnapshotId)
     {
         if (toSnapshotId == 0 || fromSnapshotId == toSnapshotId) {

@@ -97,8 +97,11 @@ public class IcebergSplitManager
         if (table.getIcebergTableName().getTableType() == CHANGELOG) {
             // if the snapshot isn't specified, grab the oldest available version of the table
             long fromSnapshot = table.getIcebergTableName().getSnapshotId().orElseGet(() -> SnapshotUtil.oldestAncestor(icebergTable).snapshotId());
+            // A lambda, not a method reference: a reference's receiver is evaluated when the
+            // reference is created, so currentSnapshot() ran even when an end snapshot was given,
+            // and a table with no snapshot at all failed rather than using the bound it was handed.
             long toSnapshot = table.getIcebergTableName().getChangelogEndSnapshot()
-                    .orElseGet(icebergTable.currentSnapshot()::snapshotId);
+                    .orElseGet(() -> icebergTable.currentSnapshot().snapshotId());
             if (rangeAddsDeleteFiles(icebergTable, fromSnapshot, toSnapshot)) {
                 // Iceberg's changelog scan refuses to plan a range whose snapshots carry delete
                 // manifests, so the range is planned here instead. Without this the changelog

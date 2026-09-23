@@ -18,6 +18,8 @@ import com.facebook.presto.common.function.OperatorType;
 import com.facebook.presto.common.predicate.Domain;
 import com.facebook.presto.common.predicate.TupleDomain;
 import com.facebook.presto.common.type.BooleanType;
+import com.facebook.presto.common.type.RowType;
+import com.facebook.presto.common.type.Type;
 import com.facebook.presto.metadata.Metadata;
 import com.facebook.presto.spi.ChangedRowsPredicate;
 import com.facebook.presto.spi.ColumnHandle;
@@ -26,6 +28,7 @@ import com.facebook.presto.spi.MaterializedViewDefinition;
 import com.facebook.presto.spi.MaterializedViewDefinition.TableColumn;
 import com.facebook.presto.spi.PrestoWarning;
 import com.facebook.presto.spi.SchemaTableName;
+import com.facebook.presto.spi.TableHandle;
 import com.facebook.presto.spi.VariableAllocator;
 import com.facebook.presto.spi.WarningCollector;
 import com.facebook.presto.spi.plan.AggregationNode;
@@ -73,6 +76,7 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.function.Function;
 
+import static com.facebook.presto.common.type.IntegerType.INTEGER;
 import static com.facebook.presto.expressions.LogicalRowExpressions.TRUE_CONSTANT;
 import static com.facebook.presto.expressions.LogicalRowExpressions.and;
 import static com.facebook.presto.expressions.LogicalRowExpressions.or;
@@ -81,9 +85,11 @@ import static com.facebook.presto.spi.StandardWarningCode.MATERIALIZED_VIEW_STIT
 import static com.facebook.presto.spi.plan.AggregationNode.Step.SINGLE;
 import static com.facebook.presto.spi.plan.JoinType.INNER;
 import static com.facebook.presto.spi.plan.JoinType.LEFT;
+import static com.facebook.presto.spi.relation.SpecialFormExpression.Form.DEREFERENCE;
 import static com.facebook.presto.spi.relation.SpecialFormExpression.Form.IS_NULL;
 import static com.facebook.presto.sql.planner.optimizations.PlanNodeSearcher.searchFrom;
 import static com.facebook.presto.sql.planner.plan.AssignmentUtils.identityAssignments;
+import static com.facebook.presto.sql.relational.Expressions.constant;
 import static com.facebook.presto.sql.relational.Expressions.not;
 import static com.google.common.base.Preconditions.checkState;
 import static com.google.common.collect.ImmutableList.toImmutableList;
@@ -539,6 +545,7 @@ public class DifferentialPlanRewriter
                 baseScan,
                 changedRowDisjuncts,
                 resolveIdentifierHandles(identifierColumns.keySet(), columnHandles, baseTable),
+                changedRows,
                 idAllocator,
                 variableAllocator);
 
@@ -706,13 +713,19 @@ public class DifferentialPlanRewriter
     }
 
     /**
-     * {@code affected_identifiers(base, identifier_columns) = DISTINCT(from_current_base)}, where
-     * {@code from_current_base} scans the base table, keeps the rows the changed-rows disjuncts
-     * select, and projects the identifier columns.
+     * {@code affected_identifiers(base, identifier_columns) = DISTINCT(from_current_base UNION ALL
+     * from_removed_rows)}, where {@code from_current_base} scans the base table, keeps the rows the
+     * changed-rows disjuncts select, and projects the identifier columns.
      *
      * <p>The disjuncts are the partition-level stale predicates for a partition-level candidate and
      * the connector's row-level changed-rows predicates for a row-level one; the construction is
      * identical either way, which is the point of the shared helper.
+     *
+     * <p>{@code from_removed_rows} is present only when the connector said where the rows the range
+     * removed can be read. It has to be a second branch rather than a wider predicate because the
+     * disjuncts select rows of the table as it stands, and a removed row is not there to select --
+     * so without it a group that lost all of its rows is excluded from the fresh branch and has
+     * nothing to recompute it from, and keeps its stale aggregate for good.
      */
     private static AffectedIdentifiers buildAffectedIdentifiers(
             Metadata metadata,
@@ -720,6 +733,7 @@ public class DifferentialPlanRewriter
             TableScanNode baseScan,
             List<TupleDomain<ColumnHandle>> disjuncts,
             Map<String, ColumnHandle> identifierColumns,
+            ChangedRowsPredicate changedRowsPredicate,
             PlanNodeIdAllocator idAllocator,
             VariableAllocator variableAllocator)
     {
@@ -728,11 +742,11 @@ public class DifferentialPlanRewriter
         // union and the DISTINCT narrows to the identifiers afterwards.
         Map<ColumnHandle, VariableReferenceExpression> variablesByHandle = new LinkedHashMap<>();
         for (ColumnHandle handle : identifierColumns.values()) {
-            allocateScanVariable(metadata, session, baseScan, handle, variablesByHandle, variableAllocator);
+            allocateScanVariable(metadata, session, baseScan.getTable(), handle, variablesByHandle, variableAllocator);
         }
         for (TupleDomain<ColumnHandle> disjunct : disjuncts) {
             for (ColumnHandle handle : disjunct.getDomains().orElse(ImmutableMap.of()).keySet()) {
-                allocateScanVariable(metadata, session, baseScan, handle, variablesByHandle, variableAllocator);
+                allocateScanVariable(metadata, session, baseScan.getTable(), handle, variablesByHandle, variableAllocator);
             }
         }
 
@@ -766,13 +780,50 @@ public class DifferentialPlanRewriter
                 scan,
                 or(changedExpressions.build()));
 
-        Map<String, VariableReferenceExpression> identifierVariables = identifierColumns.entrySet().stream()
+        Map<String, VariableReferenceExpression> baseIdentifierVariables = identifierColumns.entrySet().stream()
                 .collect(toImmutableMap(Map.Entry::getKey, entry -> variablesByHandle.get(entry.getValue())));
+
+        PlanNode identifierSource = changedRows;
+        Map<String, VariableReferenceExpression> identifierVariables = baseIdentifierVariables;
+        if (changedRowsPredicate != null && changedRowsPredicate.getRemovedRows().isPresent()) {
+            // Narrow the base branch to the identifiers before the union: it also read whatever
+            // columns the disjuncts constrain, which the removed-rows branch has no counterpart for.
+            ProjectNode baseBranch = new ProjectNode(
+                    idAllocator.getNextId(),
+                    changedRows,
+                    identityAssignments(baseIdentifierVariables.values()));
+
+            RemovedRowsBranch removedBranch = buildRemovedRowsBranch(
+                    metadata,
+                    session,
+                    baseScan,
+                    changedRowsPredicate.getRemovedRows().get(),
+                    identifierColumns,
+                    idAllocator,
+                    variableAllocator);
+
+            ImmutableMap.Builder<String, VariableReferenceExpression> unionVariables = ImmutableMap.builder();
+            ImmutableListMultimap.Builder<VariableReferenceExpression, VariableReferenceExpression> mapping = ImmutableListMultimap.builder();
+            for (Map.Entry<String, VariableReferenceExpression> entry : baseIdentifierVariables.entrySet()) {
+                VariableReferenceExpression output = variableAllocator.newVariable(entry.getValue());
+                unionVariables.put(entry.getKey(), output);
+                mapping.put(output, entry.getValue());
+                mapping.put(output, removedBranch.identifiers.get(entry.getKey()));
+            }
+            identifierVariables = unionVariables.build();
+            ImmutableListMultimap<VariableReferenceExpression, VariableReferenceExpression> variableMapping = mapping.build();
+            identifierSource = new UnionNode(
+                    baseScan.getSourceLocation(),
+                    idAllocator.getNextId(),
+                    ImmutableList.of(baseBranch, removedBranch.plan),
+                    ImmutableList.copyOf(variableMapping.keySet()),
+                    SetOperationNodeUtils.fromListMultimap(variableMapping));
+        }
 
         AggregationNode distinctIdentifiers = new AggregationNode(
                 baseScan.getSourceLocation(),
                 idAllocator.getNextId(),
-                changedRows,
+                identifierSource,
                 ImmutableMap.of(),
                 new AggregationNode.GroupingSetDescriptor(ImmutableList.copyOf(identifierVariables.values()), 1, ImmutableSet.of()),
                 ImmutableList.of(),
@@ -796,16 +847,115 @@ public class DifferentialPlanRewriter
         return new AffectedIdentifiers(withMarker, identifierVariables, marker);
     }
 
-    private static void allocateScanVariable(
+    /**
+     * A plan producing the identifiers of rows the range removed, and the variables carrying them.
+     */
+    private static final class RemovedRowsBranch
+    {
+        private final PlanNode plan;
+        private final Map<String, VariableReferenceExpression> identifiers;
+
+        private RemovedRowsBranch(PlanNode plan, Map<String, VariableReferenceExpression> identifiers)
+        {
+            this.plan = plan;
+            this.identifiers = identifiers;
+        }
+    }
+
+    /**
+     * Reads the connector's removed-rows relation and projects the identifier columns out of it.
+     *
+     * <p>The relation carries each removed row as a single row-typed column, so the identifiers are
+     * reached by dereferencing that column's fields by name. Nothing filters the relation: the
+     * connector's contract allows it to over-report, and an identifier that turns out not to have
+     * changed only costs one more group recomputed from the current base -- which is the direction
+     * this whole construction errs in deliberately, since under-reporting cannot be corrected later.
+     */
+    private static RemovedRowsBranch buildRemovedRowsBranch(
             Metadata metadata,
             Session session,
             TableScanNode baseScan,
+            ChangedRowsPredicate.RemovedRows removedRows,
+            Map<String, ColumnHandle> identifierColumns,
+            PlanNodeIdAllocator idAllocator,
+            VariableAllocator variableAllocator)
+    {
+        TableHandle removedTable = new TableHandle(
+                baseScan.getTable().getConnectorId(),
+                removedRows.getTable(),
+                baseScan.getTable().getTransaction(),
+                Optional.empty());
+
+        ColumnHandle rowColumn = metadata.getColumnHandles(session, removedTable).get(removedRows.getRowColumn());
+        if (rowColumn == null) {
+            throw new UnsupportedOperationException(format(
+                    "removed-rows relation does not expose the column %s that holds the removed row",
+                    removedRows.getRowColumn()));
+        }
+        Type rowColumnType = metadata.getColumnMetadata(session, removedTable, rowColumn).getType();
+        if (!(rowColumnType instanceof RowType)) {
+            throw new UnsupportedOperationException(format(
+                    "removed-rows column %s is %s, and the removed row's columns cannot be read out of it",
+                    removedRows.getRowColumn(),
+                    rowColumnType));
+        }
+        List<RowType.Field> fields = ((RowType) rowColumnType).getFields();
+
+        Map<ColumnHandle, VariableReferenceExpression> variablesByHandle = new LinkedHashMap<>();
+        allocateScanVariable(metadata, session, removedTable, rowColumn, variablesByHandle, variableAllocator);
+        VariableReferenceExpression rowVariable = variablesByHandle.get(rowColumn);
+
+        TableScanNode scan = new TableScanNode(
+                baseScan.getSourceLocation(),
+                idAllocator.getNextId(),
+                removedTable,
+                ImmutableList.of(rowVariable),
+                ImmutableMap.of(rowVariable, rowColumn),
+                ImmutableList.of(),
+                TupleDomain.all(),
+                TupleDomain.all(),
+                Optional.empty());
+
+        ImmutableMap.Builder<String, VariableReferenceExpression> identifiers = ImmutableMap.builder();
+        Assignments.Builder assignments = Assignments.builder();
+        for (String identifierName : identifierColumns.keySet()) {
+            int fieldIndex = -1;
+            for (int index = 0; index < fields.size(); index++) {
+                Optional<String> fieldName = fields.get(index).getName();
+                if (fieldName.isPresent() && fieldName.get().equalsIgnoreCase(identifierName)) {
+                    fieldIndex = index;
+                    break;
+                }
+            }
+            if (fieldIndex < 0) {
+                throw new UnsupportedOperationException(format(
+                        "removed-rows relation does not carry the column %s that identifies an affected group", identifierName));
+            }
+            RowType.Field field = fields.get(fieldIndex);
+            VariableReferenceExpression variable = variableAllocator.newVariable(identifierName, field.getType());
+            assignments.put(variable, new SpecialFormExpression(
+                    DEREFERENCE,
+                    field.getType(),
+                    rowVariable,
+                    constant((long) fieldIndex, INTEGER)));
+            identifiers.put(identifierName, variable);
+        }
+
+        return new RemovedRowsBranch(
+                new ProjectNode(idAllocator.getNextId(), scan, assignments.build()),
+                identifiers.build());
+    }
+
+    private static void allocateScanVariable(
+            Metadata metadata,
+            Session session,
+            TableHandle table,
             ColumnHandle handle,
             Map<ColumnHandle, VariableReferenceExpression> variablesByHandle,
             VariableAllocator variableAllocator)
     {
         variablesByHandle.computeIfAbsent(handle, column -> {
-            ColumnMetadata columnMetadata = metadata.getColumnMetadata(session, baseScan.getTable(), column);
+            ColumnMetadata columnMetadata = metadata.getColumnMetadata(session, table, column);
             return variableAllocator.newVariable(columnMetadata.getName(), columnMetadata.getType());
         });
     }
@@ -1627,6 +1777,7 @@ public class DifferentialPlanRewriter
                     baseScan,
                     changedRows.getDataDisjuncts(),
                     identifierColumns.buildKeepingLast(),
+                    changedRows,
                     idAllocator,
                     variableAllocator);
 
