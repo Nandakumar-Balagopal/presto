@@ -18,6 +18,7 @@ import com.facebook.presto.common.Page;
 import com.facebook.presto.common.QualifiedObjectName;
 import com.facebook.presto.common.predicate.TupleDomain;
 import com.facebook.presto.common.transaction.TransactionId;
+import com.facebook.presto.iceberg.delete.DeletionVectors;
 import com.facebook.presto.metadata.Metadata;
 import com.facebook.presto.spi.ChangeKindPageSource;
 import com.facebook.presto.spi.ColumnHandle;
@@ -29,20 +30,27 @@ import com.facebook.presto.testing.QueryRunner;
 import com.facebook.presto.tests.AbstractTestQueryFramework;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
+import com.google.common.io.ByteStreams;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.iceberg.BaseTable;
 import org.apache.iceberg.CatalogUtil;
 import org.apache.iceberg.DeleteFile;
 import org.apache.iceberg.FileFormat;
-import org.apache.iceberg.FileMetadata;
 import org.apache.iceberg.FileScanTask;
 import org.apache.iceberg.Table;
 import org.apache.iceberg.TableMetadata;
 import org.apache.iceberg.TableOperations;
 import org.apache.iceberg.catalog.Catalog;
 import org.apache.iceberg.catalog.TableIdentifier;
+import org.apache.iceberg.deletes.BaseDVFileWriter;
+import org.apache.iceberg.deletes.DVFileWriter;
 import org.apache.iceberg.hadoop.HadoopCatalog;
 import org.apache.iceberg.io.CloseableIterable;
+import org.apache.iceberg.io.DeleteWriteResult;
+import org.apache.iceberg.io.OutputFileFactory;
+import org.apache.iceberg.io.SeekableInputStream;
+import org.roaringbitmap.longlong.LongBitmapDataProvider;
+import org.roaringbitmap.longlong.Roaring64Bitmap;
 import org.testng.annotations.DataProvider;
 import org.testng.annotations.Test;
 
@@ -61,6 +69,7 @@ import static com.facebook.presto.iceberg.FileFormat.PARQUET;
 import static com.facebook.presto.iceberg.IcebergQueryRunner.ICEBERG_CATALOG;
 import static com.facebook.presto.iceberg.IcebergQueryRunner.getIcebergDataDirectoryPath;
 import static com.facebook.presto.iceberg.IcebergUtil.MAX_FORMAT_VERSION_FOR_METADATA_TABLES;
+import static java.lang.Math.toIntExact;
 import static java.lang.String.format;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.testng.Assert.assertEquals;
@@ -456,42 +465,164 @@ public class TestIcebergV3
         }
     }
 
+    /**
+     * Writes a deletion vector with Iceberg's own writer and reads it back through Presto. Because
+     * the vector is produced by {@link BaseDVFileWriter} rather than assembled by the test, this
+     * pins Presto's decoder against the format Iceberg actually emits -- the blob framing, the
+     * checksum and the little-endian bitmap layout all have to agree, or the deleted rows come
+     * back.
+     */
     @Test
-    public void testPuffinDeletionVectorsNotSupported()
+    public void testPuffinDeletionVectorsAreApplied()
             throws Exception
     {
-        String tableName = "test_puffin_deletion_vectors_not_supported";
+        String tableName = "test_puffin_deletion_vectors_applied";
         try {
             assertUpdate("CREATE TABLE " + tableName + " (id integer, value varchar) WITH (\"format-version\" = '3')");
-            assertUpdate("INSERT INTO " + tableName + " VALUES (1, 'one'), (2, 'two')", 2);
+            assertUpdate("INSERT INTO " + tableName + " VALUES (1, 'one'), (2, 'two'), (3, 'three'), (4, 'four'), (5, 'five')", 5);
 
             Table table = loadTable(tableName);
-
-            // Attach a PUFFIN delete vector to an existing data file in the v3 table
-            try (CloseableIterable<FileScanTask> tasks = table.newScan().planFiles()) {
-                FileScanTask task = tasks.iterator().next();
-
-                DeleteFile puffinDeleteFile = FileMetadata.deleteFileBuilder(task.spec())
-                        .ofPositionDeletes()
-                        .withPath(task.file().path().toString() + ".puffin")
-                        .withFileSizeInBytes(16)
-                        .withFormat(FileFormat.PUFFIN)
-                        .withRecordCount(1)
-                        .withContentOffset(0)
-                        .withContentSizeInBytes(16)
-                        .withReferencedDataFile(task.file().path().toString())
-                        .build();
-
-                table.newRowDelta()
-                        .addDeletes(puffinDeleteFile)
-                        .commit();
+            // Positions are file-relative, so the rows to delete are only predictable while the
+            // insert landed in a single file.
+            List<FileScanTask> tasks = new ArrayList<>();
+            try (CloseableIterable<FileScanTask> planned = table.newScan().planFiles()) {
+                planned.forEach(tasks::add);
             }
+            assertEquals(tasks.size(), 1, "expected the insert to produce exactly one data file");
+            FileScanTask task = tasks.get(0);
 
-            assertQueryFails("SELECT * FROM " + tableName, "Iceberg deletion vectors.*PUFFIN.*not supported");
+            // Delete 'two' and 'four', at positions 1 and 3.
+            deleteWithDeletionVector(table, task, ImmutableList.of(1L, 3L));
+
+            assertQuery("SELECT id, value FROM " + tableName, "VALUES (1, 'one'), (3, 'three'), (5, 'five')");
+            assertQuery("SELECT count(*) FROM " + tableName, "VALUES 3");
+            // The vector must survive a predicate that pushes down to the reader.
+            assertQuery("SELECT value FROM " + tableName + " WHERE id >= 3", "VALUES 'three', 'five'");
         }
         finally {
             dropTable(tableName);
         }
+    }
+
+    /**
+     * A vector covering every position leaves nothing behind, which is the case where an
+     * off-by-one in the framing is least likely to show up as a wrong row and most likely to show
+     * up as no deletion at all.
+     */
+    @Test
+    public void testPuffinDeletionVectorDeletingEveryRow()
+            throws Exception
+    {
+        String tableName = "test_puffin_deletion_vector_all_rows";
+        try {
+            assertUpdate("CREATE TABLE " + tableName + " (id integer, value varchar) WITH (\"format-version\" = '3')");
+            assertUpdate("INSERT INTO " + tableName + " VALUES (1, 'one'), (2, 'two'), (3, 'three')", 3);
+
+            Table table = loadTable(tableName);
+            List<FileScanTask> tasks = new ArrayList<>();
+            try (CloseableIterable<FileScanTask> planned = table.newScan().planFiles()) {
+                planned.forEach(tasks::add);
+            }
+            assertEquals(tasks.size(), 1, "expected the insert to produce exactly one data file");
+
+            deleteWithDeletionVector(table, tasks.get(0), ImmutableList.of(0L, 1L, 2L));
+
+            assertQuery("SELECT count(*) FROM " + tableName, "VALUES 0");
+        }
+        finally {
+            dropTable(tableName);
+        }
+    }
+
+    /**
+     * A vector whose positions are spread beyond a single 32-bit Roaring key, which is the only
+     * case that exercises the multi-bitmap path of the portable 64-bit layout -- one bitmap per
+     * high-order key, in ascending key order.
+     */
+    @Test
+    public void testPuffinDeletionVectorSpanningMultipleBitmapKeys()
+            throws Exception
+    {
+        // No table is needed: this asserts the decoder directly, because producing a data file
+        // with more than 2^32 rows is not practical.
+        LongBitmapDataProvider deletedRows = new Roaring64Bitmap();
+        long highKeyPosition = (1L << 32) + 7L;
+        byte[] blob = serializeDeletionVector(ImmutableList.of(3L, highKeyPosition));
+
+        DeletionVectors.deserialize(blob, "test", deletedRows);
+
+        assertTrue(deletedRows.contains(3L));
+        assertTrue(deletedRows.contains(highKeyPosition));
+        assertEquals(deletedRows.getLongCardinality(), 2L);
+    }
+
+    @Test
+    public void testPuffinDeletionVectorRejectsACorruptedBlob()
+            throws Exception
+    {
+        byte[] blob = serializeDeletionVector(ImmutableList.of(1L, 2L, 3L));
+        // Corrupt a byte of the bitmap, leaving the length and the stored checksum intact.
+        blob[blob.length - 6] ^= 0x7f;
+
+        assertThatThrownBy(() -> DeletionVectors.deserialize(blob, "corrupt", new Roaring64Bitmap()))
+                .hasMessageContaining("failed its checksum");
+    }
+
+    /**
+     * Produces a deletion-vector blob with Iceberg's writer, then reads back exactly the bytes the
+     * manifest says the blob occupies -- the same range Presto's reader uses.
+     */
+    private byte[] serializeDeletionVector(List<Long> positions)
+            throws Exception
+    {
+        String tableName = "test_dv_blob_source";
+        try {
+            assertUpdate("CREATE TABLE " + tableName + " (id integer) WITH (\"format-version\" = '3')");
+            assertUpdate("INSERT INTO " + tableName + " VALUES 1", 1);
+            Table table = loadTable(tableName);
+            List<FileScanTask> tasks = new ArrayList<>();
+            try (CloseableIterable<FileScanTask> planned = table.newScan().planFiles()) {
+                planned.forEach(tasks::add);
+            }
+            FileScanTask task = tasks.get(0);
+
+            DeleteFile deleteFile = writeDeletionVector(table, task, positions);
+            byte[] blob = new byte[toIntExact(deleteFile.contentSizeInBytes())];
+            try (SeekableInputStream input = table.io().newInputFile(deleteFile.path().toString()).newStream()) {
+                input.seek(deleteFile.contentOffset());
+                ByteStreams.readFully(input, blob);
+            }
+            return blob;
+        }
+        finally {
+            dropTable(tableName);
+        }
+    }
+
+    private void deleteWithDeletionVector(Table table, FileScanTask task, List<Long> positions)
+            throws Exception
+    {
+        table.newRowDelta()
+                .addDeletes(writeDeletionVector(table, task, positions))
+                .commit();
+    }
+
+    private DeleteFile writeDeletionVector(Table table, FileScanTask task, List<Long> positions)
+            throws Exception
+    {
+        OutputFileFactory fileFactory = OutputFileFactory.builderFor(table, 1, 1)
+                .format(FileFormat.PUFFIN)
+                .build();
+        DeleteWriteResult result;
+        try (DVFileWriter writer = new BaseDVFileWriter(fileFactory, path -> null)) {
+            for (long position : positions) {
+                writer.delete(task.file().path().toString(), position, task.spec(), task.file().partition());
+            }
+            writer.close();
+            result = writer.result();
+        }
+        assertEquals(result.deleteFiles().size(), 1, "expected a single deletion vector file");
+        return result.deleteFiles().get(0);
     }
 
     @Test

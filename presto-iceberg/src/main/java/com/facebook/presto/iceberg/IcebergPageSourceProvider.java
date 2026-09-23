@@ -162,6 +162,9 @@ import static com.facebook.presto.iceberg.IcebergUtil.getShallowWrappedIcebergTa
 import static com.facebook.presto.iceberg.TypeConverter.ORC_ICEBERG_ID_KEY;
 import static com.facebook.presto.iceberg.TypeConverter.toHiveType;
 import static com.facebook.presto.iceberg.TypeConverter.toPrestoType;
+import static com.facebook.presto.iceberg.delete.DeletionVectors.applyDeletionVector;
+import static com.facebook.presto.iceberg.delete.DeletionVectors.blobLength;
+import static com.facebook.presto.iceberg.delete.DeletionVectors.blobOffset;
 import static com.facebook.presto.iceberg.delete.EqualityDeleteFilter.readEqualityDeletes;
 import static com.facebook.presto.iceberg.delete.PositionDeleteFilter.readPositionDeletes;
 import static com.facebook.presto.memory.context.AggregatedMemoryContext.newSimpleAggregatedMemoryContext;
@@ -189,6 +192,7 @@ import static com.google.common.collect.ImmutableSet.toImmutableSet;
 import static com.google.common.collect.Maps.uniqueIndex;
 import static io.airlift.slice.Slices.EMPTY_SLICE;
 import static io.airlift.slice.Slices.utf8Slice;
+import static java.lang.Math.toIntExact;
 import static java.lang.String.format;
 import static java.time.ZoneOffset.UTC;
 import static java.util.Locale.ENGLISH;
@@ -1044,10 +1048,29 @@ public class IcebergPageSourceProvider
         }
 
         for (DeleteFile delete : deleteFiles) {
-            if (delete.format() == com.facebook.presto.iceberg.FileFormat.PUFFIN) {
-                throw new PrestoException(NOT_SUPPORTED, "Iceberg deletion vectors using PUFFIN format are not supported");
-            }
             if (delete.content() == POSITION_DELETES) {
+                if (delete.format() == com.facebook.presto.iceberg.FileFormat.PUFFIN) {
+                    // A deletion vector is scoped to exactly one data file, so a vector naming a
+                    // different file would delete positions that have nothing to do with this
+                    // split. Iceberg associates the two in the manifest and the split carries that
+                    // association, so a mismatch here means the metadata disagrees with itself.
+                    String referenced = delete.getReferencedDataFile().orElseThrow(() -> new PrestoException(
+                            ICEBERG_BAD_DATA,
+                            format("Deletion vector %s does not name the data file it applies to", delete.path())));
+                    if (!referenced.equals(dataFilePath)) {
+                        throw new PrestoException(ICEBERG_BAD_DATA, format(
+                                "Deletion vector %s applies to %s, but was attached to the split for %s",
+                                delete.path(),
+                                referenced,
+                                dataFilePath));
+                    }
+                    applyDeletionVector(readDeletionVectorBlob(session, delete), delete, deletedRows);
+                    if (storeDeleteFilePath) {
+                        filters.add(new PositionDeleteFilter(deletedRows, delete.path()));
+                        deletedRows = new Roaring64Bitmap();
+                    }
+                    continue;
+                }
                 if (startRowPosition.isPresent()) {
                     byte[] lowerBoundBytes = delete.getLowerBounds().get(DELETE_FILE_POS.fieldId());
                     Optional<Long> positionLowerBound = Optional.ofNullable(lowerBoundBytes)
@@ -1098,6 +1121,30 @@ public class IcebergPageSourceProvider
         }
 
         return filters;
+    }
+
+    /**
+     * Reads just the one deletion-vector blob that {@code delete} points at. The manifest records
+     * the blob's byte range, so there is no need to parse the Puffin footer or to read the vectors
+     * of any other data file sharing the same Puffin file.
+     */
+    private byte[] readDeletionVectorBlob(ConnectorSession session, DeleteFile delete)
+    {
+        Path path = new Path(delete.path());
+        HdfsContext hdfsContext = new HdfsContext(session);
+        Configuration configuration = hdfsEnvironment.getConfiguration(hdfsContext, path);
+        long offset = blobOffset(delete);
+        byte[] blob = new byte[toIntExact(blobLength(delete))];
+        try {
+            ExtendedFileSystem fileSystem = hdfsEnvironment.getFileSystem(session.getUser(), path, configuration);
+            try (FSDataInputStream inputStream = hdfsEnvironment.doAs(session.getUser(), () -> fileSystem.open(path))) {
+                inputStream.readFully(offset, blob);
+            }
+        }
+        catch (IOException e) {
+            throw new PrestoException(ICEBERG_CANNOT_OPEN_SPLIT, format("Cannot open Iceberg deletion vector file: %s", delete.path()), e);
+        }
+        return blob;
     }
 
     private ConnectorPageSource openDeletes(
