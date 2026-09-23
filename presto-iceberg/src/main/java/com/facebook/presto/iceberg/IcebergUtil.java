@@ -1090,6 +1090,27 @@ public final class IcebergUtil
     }
 
     /**
+     * Whether any snapshot in the range added a delete file, which is how a row-level DELETE,
+     * UPDATE or MERGE removes rows. A delete that lines up with whole data files drops them
+     * instead and adds nothing, so it does not count here.
+     * <p>
+     * Such a range is the one Iceberg's incremental changelog scan refuses to plan, so this is
+     * what decides whether the connector has to plan the range itself.
+     */
+    public static boolean rangeAddsDeleteFiles(Table table, long fromSnapshotId, long toSnapshotId)
+    {
+        if (toSnapshotId == 0 || fromSnapshotId == toSnapshotId) {
+            return false;
+        }
+        for (Snapshot snapshot : SnapshotUtil.ancestorsBetween(table, toSnapshotId, fromSnapshotId)) {
+            if (snapshot.addedDeleteFiles(table.io()).iterator().hasNext()) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
      * Provides the delete files that need to be applied to the given table snapshot.
      *
      * @param table The table to provide deletes for

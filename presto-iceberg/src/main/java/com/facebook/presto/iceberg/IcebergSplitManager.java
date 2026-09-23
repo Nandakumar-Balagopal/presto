@@ -16,6 +16,7 @@ package com.facebook.presto.iceberg;
 import com.facebook.airlift.concurrent.ThreadPoolExecutorMBean;
 import com.facebook.presto.common.predicate.TupleDomain;
 import com.facebook.presto.common.type.TypeManager;
+import com.facebook.presto.iceberg.changelog.ChangeSetSplitSource;
 import com.facebook.presto.iceberg.changelog.ChangelogSplitSource;
 import com.facebook.presto.iceberg.equalitydeletes.EqualityDeletesSplitSource;
 import com.facebook.presto.iceberg.procedure.context.IcebergCommonProcedureContext;
@@ -47,6 +48,7 @@ import static com.facebook.presto.iceberg.IcebergTableType.EQUALITY_DELETES;
 import static com.facebook.presto.iceberg.IcebergUtil.getIcebergTable;
 import static com.facebook.presto.iceberg.IcebergUtil.getMetadataColumnConstraints;
 import static com.facebook.presto.iceberg.IcebergUtil.getNonMetadataColumnConstraints;
+import static com.facebook.presto.iceberg.IcebergUtil.rangeAddsDeleteFiles;
 import static java.util.Objects.requireNonNull;
 
 public class IcebergSplitManager
@@ -97,6 +99,12 @@ public class IcebergSplitManager
             long fromSnapshot = table.getIcebergTableName().getSnapshotId().orElseGet(() -> SnapshotUtil.oldestAncestor(icebergTable).snapshotId());
             long toSnapshot = table.getIcebergTableName().getChangelogEndSnapshot()
                     .orElseGet(icebergTable.currentSnapshot()::snapshotId);
+            if (rangeAddsDeleteFiles(icebergTable, fromSnapshot, toSnapshot)) {
+                // Iceberg's changelog scan refuses to plan a range whose snapshots carry delete
+                // manifests, so the range is planned here instead. Without this the changelog
+                // table is unreadable for any range holding a row-level delete, update or merge.
+                return new ChangeSetSplitSource(session, typeManager, icebergTable, fromSnapshot, toSnapshot);
+            }
             IncrementalChangelogScan scan = icebergTable.newIncrementalChangelogScan()
                     .metricsReporter(new RuntimeStatsMetricsReporter(session.getRuntimeStats()))
                     .fromSnapshotExclusive(fromSnapshot)

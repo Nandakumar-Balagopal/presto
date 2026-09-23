@@ -373,6 +373,37 @@ public class TestIcebergV3
     }
 
     /**
+     * The changelog table is readable over a range holding a deletion vector.
+     * <p>
+     * It is the same planning problem as the change set, reached by a different door: a scan of
+     * {@code table$changelog} went straight to Iceberg's changelog scan, so any range containing a
+     * row-level delete, update or merge made the table unreadable rather than merely incomplete.
+     */
+    @Test
+    public void testChangelogTableOverADeletionVectorRange()
+            throws Exception
+    {
+        String tableName = "test_changelog_table_dv";
+        try {
+            assertUpdate("CREATE TABLE " + tableName + " (id integer, value varchar) WITH (\"format-version\" = '3')");
+            assertUpdate("INSERT INTO " + tableName + " VALUES (1, 'one'), (2, 'two'), (3, 'three')", 3);
+            long fromSnapshotId = loadTable(tableName).currentSnapshot().snapshotId();
+
+            // Remove 'two'.
+            replaceDeletionVector(tableName, ImmutableList.of(1L));
+            long toSnapshotId = loadTable(tableName).currentSnapshot().snapshotId();
+
+            assertQuery(
+                    format("SELECT operation, rowdata.id, rowdata.value FROM \"%s@%s$changelog@%s\"",
+                            tableName, fromSnapshotId, toSnapshotId),
+                    "VALUES ('DELETE', 2, 'two')");
+        }
+        finally {
+            dropTable(tableName);
+        }
+    }
+
+    /**
      * The cost estimate has to answer for a range holding a deletion vector too. It cannot be
      * taken from Iceberg's changelog scan, which throws while planning such a range, and the
      * throw is an {@link UnsupportedOperationException} that the estimator does not catch -- so

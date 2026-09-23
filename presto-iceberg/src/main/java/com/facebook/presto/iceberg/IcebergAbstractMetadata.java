@@ -250,6 +250,7 @@ import static com.facebook.presto.iceberg.IcebergUtil.getSnapshotIdTimeOperator;
 import static com.facebook.presto.iceberg.IcebergUtil.getSortFields;
 import static com.facebook.presto.iceberg.IcebergUtil.getTableComment;
 import static com.facebook.presto.iceberg.IcebergUtil.opsFromTable;
+import static com.facebook.presto.iceberg.IcebergUtil.rangeAddsDeleteFiles;
 import static com.facebook.presto.iceberg.IcebergUtil.resolveSnapshotIdByName;
 import static com.facebook.presto.iceberg.IcebergUtil.supportsRowLineage;
 import static com.facebook.presto.iceberg.IcebergUtil.toHiveColumns;
@@ -1532,24 +1533,6 @@ public abstract class IcebergAbstractMetadata
             return OptionalLong.empty();
         }
         return OptionalLong.of(rowCount);
-    }
-
-    /**
-     * Whether any snapshot in the range added a delete file, which is how a row-level DELETE,
-     * UPDATE or MERGE removes rows. A delete that lines up with whole data files drops them
-     * instead and adds nothing, so it does not count here.
-     */
-    private static boolean rangeAddsDeleteFiles(Table table, long fromSnapshotId, long toSnapshotId)
-    {
-        if (toSnapshotId == 0 || fromSnapshotId == toSnapshotId) {
-            return false;
-        }
-        for (Snapshot snapshot : SnapshotUtil.ancestorsBetween(table, toSnapshotId, fromSnapshotId)) {
-            if (snapshot.addedDeleteFiles(table.io()).iterator().hasNext()) {
-                return true;
-            }
-        }
-        return false;
     }
 
     private static boolean isAppendOnlyRange(Table table, long fromSnapshotId, long toSnapshotId)
