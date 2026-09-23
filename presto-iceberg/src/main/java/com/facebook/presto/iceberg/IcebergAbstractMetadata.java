@@ -1456,6 +1456,14 @@ public abstract class IcebergAbstractMetadata
         List<IcebergColumnHandle> columns = projectedDataColumns.stream()
                 .map(IcebergColumnHandle.class::cast)
                 .collect(toImmutableList());
+        if (rangeAddsDeleteFiles(icebergTable, fromSnapshotId, toSnapshotId)) {
+            // Iceberg's changelog scan throws UnsupportedOperationException on such a range, deep
+            // inside planning. Fail here instead, where the reason can be stated: the rows a
+            // delete file removed are still in the data file it points at, but nothing in the
+            // connector reads a data file through its own delete file to recover them.
+            throw new PrestoException(NOT_SUPPORTED, "Row-level change tracking cannot yet report rows removed by a delete file");
+        }
+
         TupleDomain<IcebergColumnHandle> icebergFilter = filter.transform(IcebergColumnHandle.class::cast);
         IcebergTableHandle targetTableHandle = getTableHandle(session, icebergTableHandle.getSchemaTableName(), Optional.of(to));
         IncrementalChangelogScan scan = icebergTable.newIncrementalChangelogScan()
@@ -1478,6 +1486,24 @@ public abstract class IcebergAbstractMetadata
      * only added data. Anything else -- a delete, an overwrite, a compaction rewrite -- can remove
      * rows, which a predicate over the row-lineage sequence number cannot detect.
      */
+    /**
+     * Whether any snapshot in the range added a delete file, which is how a row-level DELETE,
+     * UPDATE or MERGE removes rows. A delete that lines up with whole data files drops them
+     * instead and adds nothing, so it does not count here.
+     */
+    private static boolean rangeAddsDeleteFiles(Table table, long fromSnapshotId, long toSnapshotId)
+    {
+        if (toSnapshotId == 0 || fromSnapshotId == toSnapshotId) {
+            return false;
+        }
+        for (Snapshot snapshot : SnapshotUtil.ancestorsBetween(table, toSnapshotId, fromSnapshotId)) {
+            if (snapshot.addedDeleteFiles(table.io()).iterator().hasNext()) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     private static boolean isAppendOnlyRange(Table table, long fromSnapshotId, long toSnapshotId)
     {
         if (toSnapshotId == 0 || fromSnapshotId == toSnapshotId) {

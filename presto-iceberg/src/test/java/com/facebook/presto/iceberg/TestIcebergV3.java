@@ -284,6 +284,65 @@ public class TestIcebergV3
         }
     }
 
+    /**
+     * A range holding a deletion vector is declined, with a reason.
+     * <p>
+     * The rows such a range removed are not reachable from the current table: they survive only in
+     * the data file the vector points at, and recovering them means reading that file through its
+     * own vector, keeping the marked positions rather than discarding them. Nothing in the
+     * connector does that yet. Until it does, the range has to be refused rather than answered
+     * with the rows that remain -- which is what the ordinary read path returns, and which would
+     * be silently and completely wrong.
+     * <p>
+     * The assertion is on the message rather than merely on failure, because Iceberg's changelog
+     * scan already refuses these ranges on its own with
+     * {@code UnsupportedOperationException: Delete files are currently not supported in changelog
+     * scans}. A test that only checked for failure would keep passing if this ever started
+     * returning surviving rows instead.
+     */
+    @Test
+    public void testSystemChangesDeclinesRangeWithADeletionVector()
+            throws Exception
+    {
+        String tableName = "test_system_changes_dv";
+        try {
+            assertUpdate("CREATE TABLE " + tableName + " (id integer, value varchar) WITH (\"format-version\" = '3')");
+            assertUpdate("INSERT INTO " + tableName + " VALUES (1, 'one'), (2, 'two'), (3, 'three'), (4, 'four')", 4);
+            long fromSnapshotId = loadTable(tableName).currentSnapshot().snapshotId();
+
+            Table table = loadTable(tableName);
+            List<FileScanTask> tasks = new ArrayList<>();
+            try (CloseableIterable<FileScanTask> planned = table.newScan().planFiles()) {
+                planned.forEach(tasks::add);
+            }
+            assertEquals(tasks.size(), 1, "expected the insert to produce exactly one data file");
+            // Remove 'two' and 'four'.
+            deleteWithDeletionVector(table, tasks.get(0), ImmutableList.of(1L, 3L));
+            long toSnapshotId = loadTable(tableName).currentSnapshot().snapshotId();
+
+            // The vector is applied on the ordinary read path, so the rows really are gone.
+            assertQuery("SELECT id FROM " + tableName + " ORDER BY id", "VALUES 1, 3");
+
+            assertQueryFails(
+                    changes(tableName, fromSnapshotId, toSnapshotId),
+                    ".*cannot yet report rows removed by a delete file.*");
+        }
+        finally {
+            dropTable(tableName);
+        }
+    }
+
+    private String changes(String tableName, long fromSnapshotId, long toSnapshotId)
+    {
+        return format(
+                "SELECT id, value, change_kind FROM TABLE(system.builtin.changes('%s.%s.%s', %s, %s))",
+                ICEBERG_CATALOG,
+                TEST_SCHEMA,
+                tableName,
+                fromSnapshotId,
+                toSnapshotId);
+    }
+
     private Session metadataSession(TransactionId transactionId)
     {
         return getSession().beginTransactionId(transactionId, getQueryRunner().getTransactionManager(), new AllowAllAccessControl());
