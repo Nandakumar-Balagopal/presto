@@ -373,6 +373,55 @@ public class TestIcebergV3
     }
 
     /**
+     * The cost estimate has to answer for a range holding a deletion vector too. It cannot be
+     * taken from Iceberg's changelog scan, which throws while planning such a range, and the
+     * throw is an {@link UnsupportedOperationException} that the estimator does not catch -- so
+     * getting this wrong surfaces as a failed query, not as a missing estimate.
+     */
+    @Test
+    public void testChangeSetSizeIsEstimatedForADeletionVectorRange()
+            throws Exception
+    {
+        String tableName = "test_change_set_size_dv";
+        try {
+            assertUpdate("CREATE TABLE " + tableName + " (id integer, value varchar) WITH (\"format-version\" = '3')");
+            assertUpdate("INSERT INTO " + tableName + " VALUES (1, 'one'), (2, 'two'), (3, 'three')", 3);
+
+            ConnectorTableVersion recordedVersion;
+            TransactionId recordedTransaction = getQueryRunner().getTransactionManager().beginTransaction(false);
+            try {
+                Session recordedSession = metadataSession(recordedTransaction);
+                recordedVersion = getQueryRunner().getMetadata()
+                        .getCurrentTableVersion(recordedSession, getTableHandle(tableName, recordedSession)).get();
+            }
+            finally {
+                getQueryRunner().getTransactionManager().asyncAbort(recordedTransaction);
+            }
+
+            replaceDeletionVector(tableName, ImmutableList.of(1L));
+
+            TransactionId refreshTransaction = getQueryRunner().getTransactionManager().beginTransaction(false);
+            try {
+                Session refreshSession = metadataSession(refreshTransaction);
+                Metadata metadata = getQueryRunner().getMetadata();
+                TableHandle tableHandle = getTableHandle(tableName, refreshSession);
+                ConnectorTableVersion refreshVersion = metadata.getCurrentTableVersion(refreshSession, tableHandle).get();
+
+                OptionalLong estimate = metadata.estimateChangeSetSize(refreshSession, tableHandle, recordedVersion, refreshVersion);
+                assertTrue(estimate.isPresent(), "expected an estimate for a range holding a deletion vector");
+                // One position marked, so one row reported.
+                assertEquals(estimate.getAsLong(), 1L);
+            }
+            finally {
+                getQueryRunner().getTransactionManager().asyncAbort(refreshTransaction);
+            }
+        }
+        finally {
+            dropTable(tableName);
+        }
+    }
+
+    /**
      * A second removal in the same range must not re-report what the first one removed. Iceberg
      * defines the rows a snapshot took away as the ones its own delete files mark minus the ones
      * the delete files already in effect had removed, and a reader that merged the two sets would

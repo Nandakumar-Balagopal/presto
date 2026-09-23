@@ -1501,6 +1501,40 @@ public abstract class IcebergAbstractMetadata
      * rows, which a predicate over the row-lineage sequence number cannot detect.
      */
     /**
+     * An upper bound on the rows a range reports, read from the manifests without opening a data
+     * file: the rows each snapshot added, the rows it dropped with a whole data file, and the
+     * positions its delete files mark. A bound rather than a count, because a delete file may mark
+     * positions an earlier one had already marked, and those are reported once.
+     * <p>
+     * A compaction is skipped, as it is when the splits are planned -- it moves rows between files
+     * without changing one, and V3 row lineage survives the move.
+     */
+    private static OptionalLong estimateChangeSetSizeFromSnapshots(Table table, long fromSnapshotId, long toSnapshotId)
+    {
+        long rowCount = 0;
+        try {
+            for (Snapshot snapshot : SnapshotUtil.ancestorsBetween(table, toSnapshotId, fromSnapshotId)) {
+                if (DataOperations.REPLACE.equals(snapshot.operation())) {
+                    continue;
+                }
+                for (DataFile file : snapshot.addedDataFiles(table.io())) {
+                    rowCount = Math.addExact(rowCount, file.recordCount());
+                }
+                for (DataFile file : snapshot.removedDataFiles(table.io())) {
+                    rowCount = Math.addExact(rowCount, file.recordCount());
+                }
+                for (org.apache.iceberg.DeleteFile file : snapshot.addedDeleteFiles(table.io())) {
+                    rowCount = Math.addExact(rowCount, file.recordCount());
+                }
+            }
+        }
+        catch (ArithmeticException e) {
+            return OptionalLong.empty();
+        }
+        return OptionalLong.of(rowCount);
+    }
+
+    /**
      * Whether any snapshot in the range added a delete file, which is how a row-level DELETE,
      * UPDATE or MERGE removes rows. A delete that lines up with whole data files drops them
      * instead and adds nothing, so it does not count here.
@@ -1572,6 +1606,12 @@ public abstract class IcebergAbstractMetadata
         }
         if (!isAncestorOf(icebergTable, toSnapshotId, fromSnapshotId)) {
             return OptionalLong.empty();
+        }
+
+        if (rangeAddsDeleteFiles(icebergTable, fromSnapshotId, toSnapshotId)) {
+            // planFiles() throws on such a range, so the estimate comes from the manifests the
+            // same way the splits do.
+            return estimateChangeSetSizeFromSnapshots(icebergTable, fromSnapshotId, toSnapshotId);
         }
 
         IncrementalChangelogScan scan = icebergTable.newIncrementalChangelogScan()
