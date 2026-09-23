@@ -327,23 +327,20 @@ public class TestIcebergV3
     }
 
     /**
-     * A range holding a deletion vector is declined, with a reason.
+     * The case the change set exists for: rows removed by a deletion vector rather than by
+     * dropping whole data files.
      * <p>
-     * The rows such a range removed are not reachable from the current table: they survive only in
-     * the data file the vector points at, and recovering them means reading that file through its
-     * own vector, keeping the marked positions rather than discarding them. Nothing in the
-     * connector does that yet. Until it does, the range has to be refused rather than answered
-     * with the rows that remain -- which is what the ordinary read path returns, and which would
-     * be silently and completely wrong.
+     * Those rows are not reachable from the current table. They survive only in the data file the
+     * vector points at, and recovering them means reading that file through its own vector,
+     * keeping the marked positions rather than discarding them.
      * <p>
-     * The assertion is on the message rather than merely on failure, because Iceberg's changelog
-     * scan already refuses these ranges on its own with
-     * {@code UnsupportedOperationException: Delete files are currently not supported in changelog
-     * scans}. A test that only checked for failure would keep passing if this ever started
-     * returning surviving rows instead.
+     * The row count is asserted separately from the rows. {@code assertQuery} compares ignoring
+     * order and prints only the difference, so a result that returned all four rows against an
+     * expectation of two would report just the two extras -- which reads exactly like a result of
+     * two wrong rows. Asserting the count makes that ambiguity impossible.
      */
     @Test
-    public void testSystemChangesDeclinesRangeWithADeletionVector()
+    public void testSystemChangesRecoversRowsRemovedByDeletionVector()
             throws Exception
     {
         String tableName = "test_system_changes_dv";
@@ -365,9 +362,81 @@ public class TestIcebergV3
             // The vector is applied on the ordinary read path, so the rows really are gone.
             assertQuery("SELECT id FROM " + tableName + " ORDER BY id", "VALUES 1, 3");
 
-            assertQueryFails(
+            assertEquals(computeActual(changes(tableName, fromSnapshotId, toSnapshotId)).getRowCount(), 2);
+            assertQuery(
+                    changes(tableName, fromSnapshotId, toSnapshotId) + " ORDER BY id",
+                    "VALUES (2, 'two', 'DELETE'), (4, 'four', 'DELETE')");
+        }
+        finally {
+            dropTable(tableName);
+        }
+    }
+
+    /**
+     * A second removal in the same range must not re-report what the first one removed. Iceberg
+     * defines the rows a snapshot took away as the ones its own delete files mark minus the ones
+     * the delete files already in effect had removed, and a reader that merged the two sets would
+     * report the earlier rows again at the later snapshot.
+     */
+    @Test
+    public void testSystemChangesDoesNotRepeatAnEarlierRemoval()
+            throws Exception
+    {
+        String tableName = "test_system_changes_dv_twice";
+        try {
+            assertUpdate("CREATE TABLE " + tableName + " (id integer, value varchar) WITH (\"format-version\" = '3')");
+            assertUpdate("INSERT INTO " + tableName + " VALUES (1, 'one'), (2, 'two'), (3, 'three'), (4, 'four')", 4);
+
+            // 'one' goes before the range starts, so it must not be reported at all.
+            replaceDeletionVector(tableName, ImmutableList.of(0L));
+            long fromSnapshotId = loadTable(tableName).currentSnapshot().snapshotId();
+            // 'three' goes inside the range. The replacing vector still covers 'one', because a
+            // vector holds every deleted position of its data file rather than only the new ones.
+            replaceDeletionVector(tableName, ImmutableList.of(0L, 2L));
+            long toSnapshotId = loadTable(tableName).currentSnapshot().snapshotId();
+
+            assertQuery("SELECT id FROM " + tableName + " ORDER BY id", "VALUES 2, 4");
+
+            assertEquals(computeActual(changes(tableName, fromSnapshotId, toSnapshotId)).getRowCount(), 1);
+            assertQuery(
                     changes(tableName, fromSnapshotId, toSnapshotId),
-                    ".*cannot yet report rows removed by a delete file.*");
+                    "VALUES (3, 'three', 'DELETE')");
+        }
+        finally {
+            dropTable(tableName);
+        }
+    }
+
+    /**
+     * An insertion and a vector-based removal in one range. Both have to be reported, and the
+     * removal must not spill onto the newly added file.
+     */
+    @Test
+    public void testSystemChangesOverInsertAndDeletionVector()
+            throws Exception
+    {
+        String tableName = "test_system_changes_mixed";
+        try {
+            assertUpdate("CREATE TABLE " + tableName + " (id integer, value varchar) WITH (\"format-version\" = '3')");
+            assertUpdate("INSERT INTO " + tableName + " VALUES (1, 'one'), (2, 'two')", 2);
+            long fromSnapshotId = loadTable(tableName).currentSnapshot().snapshotId();
+
+            Table table = loadTable(tableName);
+            List<FileScanTask> tasks = new ArrayList<>();
+            try (CloseableIterable<FileScanTask> planned = table.newScan().planFiles()) {
+                planned.forEach(tasks::add);
+            }
+            // Remove 'one', at position 0 of the file that already existed.
+            deleteWithDeletionVector(table, tasks.get(0), ImmutableList.of(0L));
+            assertUpdate("INSERT INTO " + tableName + " VALUES (3, 'three')", 1);
+            long toSnapshotId = loadTable(tableName).currentSnapshot().snapshotId();
+
+            assertQuery("SELECT id FROM " + tableName + " ORDER BY id", "VALUES 2, 3");
+
+            assertEquals(computeActual(changes(tableName, fromSnapshotId, toSnapshotId)).getRowCount(), 2);
+            assertQuery(
+                    changes(tableName, fromSnapshotId, toSnapshotId) + " ORDER BY id",
+                    "VALUES (1, 'one', 'DELETE'), (3, 'three', 'INSERT')");
         }
         finally {
             dropTable(tableName);
@@ -706,6 +775,34 @@ public class TestIcebergV3
         table.newRowDelta()
                 .addDeletes(writeDeletionVector(table, task, positions))
                 .commit();
+    }
+
+    /**
+     * Commits a vector listing {@code positions}, replacing any vector already covering the data
+     * file. Iceberg permits at most one vector per data file and rejects a second as a concurrent
+     * write, so the positions given here are the complete set of deleted positions, not an
+     * addition to what a previous vector held.
+     */
+    private void replaceDeletionVector(String tableName, List<Long> positions)
+            throws Exception
+    {
+        Table table = loadTable(tableName);
+        List<FileScanTask> tasks = new ArrayList<>();
+        try (CloseableIterable<FileScanTask> planned = table.newScan().planFiles()) {
+            planned.forEach(tasks::add);
+        }
+        assertEquals(tasks.size(), 1, "expected exactly one data file");
+        FileScanTask task = tasks.get(0);
+
+        DeleteFile replacement = writeDeletionVector(table, task, positions);
+        org.apache.iceberg.RowDelta rowDelta = table.newRowDelta();
+        // Iceberg rejects adding a vector for a data file that already has one, unless the
+        // validation window is bounded: left unbounded it walks the whole history and reads the
+        // vector this commit is replacing as a concurrent write. Starting at the current snapshot
+        // leaves no room for a concurrent commit, which is true here.
+        rowDelta.validateFromSnapshot(table.currentSnapshot().snapshotId());
+        task.deletes().forEach(rowDelta::removeDeletes);
+        rowDelta.addDeletes(replacement).commit();
     }
 
     private DeleteFile writeDeletionVector(Table table, FileScanTask task, List<Long> positions)

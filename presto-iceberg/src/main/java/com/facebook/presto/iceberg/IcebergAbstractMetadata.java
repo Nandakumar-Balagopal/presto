@@ -35,6 +35,7 @@ import com.facebook.presto.hive.HivePartition;
 import com.facebook.presto.hive.NodeVersion;
 import com.facebook.presto.hive.PartitionSet;
 import com.facebook.presto.hive.UnknownTableTypeException;
+import com.facebook.presto.iceberg.changelog.ChangeSetSplitSource;
 import com.facebook.presto.iceberg.changelog.ChangelogOperation;
 import com.facebook.presto.iceberg.changelog.ChangelogUtil;
 import com.facebook.presto.iceberg.procedure.context.IcebergCommonProcedureContext;
@@ -1464,16 +1465,21 @@ public abstract class IcebergAbstractMetadata
         if (columns.contains(IS_DELETED_COLUMN_HANDLE) || columns.contains(DELETE_FILE_PATH_COLUMN_HANDLE)) {
             throw new PrestoException(NOT_SUPPORTED, "Row-level change tracking cannot project the $deleted or $delete_file_path column");
         }
-        if (rangeAddsDeleteFiles(icebergTable, fromSnapshotId, toSnapshotId)) {
-            // Iceberg's changelog scan throws UnsupportedOperationException on such a range, deep
-            // inside planning. Fail here instead, where the reason can be stated: the rows a
-            // delete file removed are still in the data file it points at, but nothing in the
-            // connector reads a data file through its own delete file to recover them.
-            throw new PrestoException(NOT_SUPPORTED, "Row-level change tracking cannot yet report rows removed by a delete file");
-        }
-
         TupleDomain<IcebergColumnHandle> icebergFilter = filter.transform(IcebergColumnHandle.class::cast);
         IcebergTableHandle targetTableHandle = getTableHandle(session, icebergTableHandle.getSchemaTableName(), Optional.of(to));
+
+        if (rangeAddsDeleteFiles(icebergTable, fromSnapshotId, toSnapshotId)) {
+            // Iceberg's changelog scan cannot plan any part of such a range: it throws
+            // UnsupportedOperationException as soon as it meets a snapshot carrying delete
+            // manifests. So the whole range is planned here instead.
+            return new IcebergChangeSetPageSource(
+                    session,
+                    pageSourceProvider,
+                    new ChangeSetSplitSource(session, typeManager, icebergTable, fromSnapshotId, toSnapshotId),
+                    createChangeSetLayout(targetTableHandle, icebergTable, columns, icebergFilter),
+                    columns);
+        }
+
         IncrementalChangelogScan scan = icebergTable.newIncrementalChangelogScan()
                 .metricsReporter(new RuntimeStatsMetricsReporter(session.getRuntimeStats()))
                 .fromSnapshotExclusive(fromSnapshotId)
