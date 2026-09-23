@@ -1456,6 +1456,14 @@ public abstract class IcebergAbstractMetadata
         List<IcebergColumnHandle> columns = projectedDataColumns.stream()
                 .map(IcebergColumnHandle.class::cast)
                 .collect(toImmutableList());
+        // Projecting either delete-marker column turns delete files from something that removes
+        // rows into something that labels them: the reader stops filtering and instead reports
+        // every row with a flag saying whether a delete file covers it. A change set read that way
+        // would report the rows that survived a delete as though they were the deleted ones, which
+        // is wrong in the worst available fashion -- quietly, and inverted. Refuse instead.
+        if (columns.contains(IS_DELETED_COLUMN_HANDLE) || columns.contains(DELETE_FILE_PATH_COLUMN_HANDLE)) {
+            throw new PrestoException(NOT_SUPPORTED, "Row-level change tracking cannot project the $deleted or $delete_file_path column");
+        }
         if (rangeAddsDeleteFiles(icebergTable, fromSnapshotId, toSnapshotId)) {
             // Iceberg's changelog scan throws UnsupportedOperationException on such a range, deep
             // inside planning. Fail here instead, where the reason can be stated: the rows a

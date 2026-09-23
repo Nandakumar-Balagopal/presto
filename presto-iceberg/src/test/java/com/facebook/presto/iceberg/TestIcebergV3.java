@@ -263,6 +263,48 @@ public class TestIcebergV3
         }
     }
 
+    /**
+     * The change set reports the table's own columns and the change kind, and nothing else.
+     * <p>
+     * A connector may expose metadata about a row -- the file holding it, its position in that
+     * file, whether a delete file marks it -- as hidden columns, which {@code SELECT *} does not
+     * return. Those are not part of a change set. Projecting them is also not merely untidy: the
+     * Iceberg reader answers a read that asks for its delete-marker column by labelling rows
+     * rather than removing them, so requesting that column decides whether delete files filter at
+     * all.
+     * <p>
+     * Asserted on the column count, because the cost of getting this wrong is extra columns nobody
+     * selected, which every existing test would happily ignore -- they all name the columns they
+     * want.
+     */
+    @Test
+    public void testSystemChangesReportsOnlyTableColumnsAndChangeKind()
+            throws Exception
+    {
+        String tableName = "test_system_changes_schema";
+        try {
+            assertUpdate("CREATE TABLE " + tableName + " (id integer, value varchar) WITH (\"format-version\" = '3')");
+            assertUpdate("INSERT INTO " + tableName + " VALUES (1, 'one')", 1);
+            long fromSnapshotId = loadTable(tableName).currentSnapshot().snapshotId();
+            assertUpdate("INSERT INTO " + tableName + " VALUES (2, 'two')", 1);
+            long toSnapshotId = loadTable(tableName).currentSnapshot().snapshotId();
+
+            String allColumns = format(
+                    "SELECT * FROM TABLE(system.builtin.changes('%s.%s.%s', %s, %s))",
+                    ICEBERG_CATALOG, TEST_SCHEMA, tableName, fromSnapshotId, toSnapshotId);
+            assertEquals(computeActual(allColumns).getTypes().size(), 3, "expected id, value and change_kind");
+
+            // The row lineage column is reported only when asked for, and then exactly once.
+            String withRowId = format(
+                    "SELECT * FROM TABLE(system.builtin.changes('%s.%s.%s', %s, %s, true))",
+                    ICEBERG_CATALOG, TEST_SCHEMA, tableName, fromSnapshotId, toSnapshotId);
+            assertEquals(computeActual(withRowId).getTypes().size(), 4, "expected id, value, $row_id and change_kind");
+        }
+        finally {
+            dropTable(tableName);
+        }
+    }
+
     @Test
     public void testSystemChangesIncludesDeletedRows()
             throws Exception

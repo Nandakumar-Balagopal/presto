@@ -169,6 +169,16 @@ public class Changes
             if (column.getName().equalsIgnoreCase("change_kind")) {
                 throw new PrestoException(NOT_SUPPORTED, "TABLE contains a column named change_kind, which is reserved by system.changes");
             }
+            // A hidden column is one the table does not return from SELECT *, which connectors use
+            // for the metadata they expose only on request -- a row's file, its position, whether a
+            // delete file marks it. None of that belongs in a change set, and asking for it is not
+            // merely noisy: a connector may answer a read that projects its delete-marker column by
+            // labelling rows instead of removing them, so requesting those columns can change which
+            // rows come back. The row lineage column is added below when the caller asks for it,
+            // which is also why skipping hidden columns here stops it being projected twice.
+            if (column.isHidden()) {
+                continue;
+            }
             ColumnHandle columnHandle = columnHandles.get(column.getName());
             if (columnHandle == null) {
                 throw new PrestoException(NOT_SUPPORTED, "TABLE column is not readable by system.changes: " + column.getName());
