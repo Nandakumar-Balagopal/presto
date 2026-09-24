@@ -54,7 +54,18 @@ public class IcebergSplit
     private final long firstRowId;
     private final long affinitySchedulingFileSectionSize;
     private final long affinitySchedulingFileSectionIndex;
+    private final List<DeleteFile> retainedDeletes;
 
+    /**
+     * @param retainedDeletes delete files whose marked rows are what this split is for, rather
+     *         than what it must skip. A row is read only if one of these files removed it and none
+     *         of {@code deletes} had removed it already.
+     *         <p>
+     *         Two lists rather than a flag inverting one: Iceberg reports the rows a snapshot
+     *         removed from a data file as the rows its newly added delete files mark, minus the
+     *         rows the delete files already in effect had removed. Both sets can name the same
+     *         data file, so a single list cannot say which sense applies to which file.
+     */
     @JsonCreator
     public IcebergSplit(
             @JsonProperty("path") String path,
@@ -71,7 +82,8 @@ public class IcebergSplit
             @JsonProperty("changelogSplitInfo") Optional<ChangelogSplitInfo> changelogSplitInfo,
             @JsonProperty("dataSequenceNumber") long dataSequenceNumber,
             @JsonProperty("firstRowId") long firstRowId,
-            @JsonProperty("affinitySchedulingSectionSize") long affinitySchedulingFileSectionSize)
+            @JsonProperty("affinitySchedulingSectionSize") long affinitySchedulingFileSectionSize,
+            @JsonProperty("retainedDeletes") List<DeleteFile> retainedDeletes)
     {
         requireNonNull(nodeSelectionStrategy, "nodeSelectionStrategy is null");
         this.path = requireNonNull(path, "path is null");
@@ -90,6 +102,53 @@ public class IcebergSplit
         this.firstRowId = firstRowId;
         this.affinitySchedulingFileSectionSize = affinitySchedulingFileSectionSize;
         this.affinitySchedulingFileSectionIndex = start / affinitySchedulingFileSectionSize;
+        this.retainedDeletes = ImmutableList.copyOf(requireNonNull(retainedDeletes, "retainedDeletes is null"));
+    }
+
+    /**
+     * Retains the signature that predates {@code retainedDeletes}, and reads as a split whose
+     * delete files only ever exclude rows.
+     */
+    public IcebergSplit(
+            String path,
+            long start,
+            long length,
+            FileFormat fileFormat,
+            List<HostAddress> addresses,
+            Map<Integer, HivePartitionKey> partitionKeys,
+            String partitionSpecAsJson,
+            Optional<String> partitionDataJson,
+            NodeSelectionStrategy nodeSelectionStrategy,
+            SplitWeight splitWeight,
+            List<DeleteFile> deletes,
+            Optional<ChangelogSplitInfo> changelogSplitInfo,
+            long dataSequenceNumber,
+            long firstRowId,
+            long affinitySchedulingFileSectionSize)
+    {
+        this(
+                path,
+                start,
+                length,
+                fileFormat,
+                addresses,
+                partitionKeys,
+                partitionSpecAsJson,
+                partitionDataJson,
+                nodeSelectionStrategy,
+                splitWeight,
+                deletes,
+                changelogSplitInfo,
+                dataSequenceNumber,
+                firstRowId,
+                affinitySchedulingFileSectionSize,
+                ImmutableList.of());
+    }
+
+    @JsonProperty
+    public List<DeleteFile> getRetainedDeletes()
+    {
+        return retainedDeletes;
     }
 
     @JsonProperty

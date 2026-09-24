@@ -263,6 +263,48 @@ public class TestIcebergV3
         }
     }
 
+    /**
+     * The change set reports the table's own columns and the change kind, and nothing else.
+     * <p>
+     * A connector may expose metadata about a row -- the file holding it, its position in that
+     * file, whether a delete file marks it -- as hidden columns, which {@code SELECT *} does not
+     * return. Those are not part of a change set. Projecting them is also not merely untidy: the
+     * Iceberg reader answers a read that asks for its delete-marker column by labelling rows
+     * rather than removing them, so requesting that column decides whether delete files filter at
+     * all.
+     * <p>
+     * Asserted on the column count, because the cost of getting this wrong is extra columns nobody
+     * selected, which every existing test would happily ignore -- they all name the columns they
+     * want.
+     */
+    @Test
+    public void testSystemChangesReportsOnlyTableColumnsAndChangeKind()
+            throws Exception
+    {
+        String tableName = "test_system_changes_schema";
+        try {
+            assertUpdate("CREATE TABLE " + tableName + " (id integer, value varchar) WITH (\"format-version\" = '3')");
+            assertUpdate("INSERT INTO " + tableName + " VALUES (1, 'one')", 1);
+            long fromSnapshotId = loadTable(tableName).currentSnapshot().snapshotId();
+            assertUpdate("INSERT INTO " + tableName + " VALUES (2, 'two')", 1);
+            long toSnapshotId = loadTable(tableName).currentSnapshot().snapshotId();
+
+            String allColumns = format(
+                    "SELECT * FROM TABLE(system.builtin.changes('%s.%s.%s', %s, %s))",
+                    ICEBERG_CATALOG, TEST_SCHEMA, tableName, fromSnapshotId, toSnapshotId);
+            assertEquals(computeActual(allColumns).getTypes().size(), 3, "expected id, value and change_kind");
+
+            // The row lineage column is reported only when asked for, and then exactly once.
+            String withRowId = format(
+                    "SELECT * FROM TABLE(system.builtin.changes('%s.%s.%s', %s, %s, true))",
+                    ICEBERG_CATALOG, TEST_SCHEMA, tableName, fromSnapshotId, toSnapshotId);
+            assertEquals(computeActual(withRowId).getTypes().size(), 4, "expected id, value, $row_id and change_kind");
+        }
+        finally {
+            dropTable(tableName);
+        }
+    }
+
     @Test
     public void testSystemChangesIncludesDeletedRows()
             throws Exception
@@ -282,6 +324,214 @@ public class TestIcebergV3
         finally {
             dropTable(tableName);
         }
+    }
+
+    /**
+     * The case the change set exists for: rows removed by a deletion vector rather than by
+     * dropping whole data files.
+     * <p>
+     * Those rows are not reachable from the current table. They survive only in the data file the
+     * vector points at, and recovering them means reading that file through its own vector,
+     * keeping the marked positions rather than discarding them.
+     * <p>
+     * The row count is asserted separately from the rows. {@code assertQuery} compares ignoring
+     * order and prints only the difference, so a result that returned all four rows against an
+     * expectation of two would report just the two extras -- which reads exactly like a result of
+     * two wrong rows. Asserting the count makes that ambiguity impossible.
+     */
+    @Test
+    public void testSystemChangesRecoversRowsRemovedByDeletionVector()
+            throws Exception
+    {
+        String tableName = "test_system_changes_dv";
+        try {
+            assertUpdate("CREATE TABLE " + tableName + " (id integer, value varchar) WITH (\"format-version\" = '3')");
+            assertUpdate("INSERT INTO " + tableName + " VALUES (1, 'one'), (2, 'two'), (3, 'three'), (4, 'four')", 4);
+            long fromSnapshotId = loadTable(tableName).currentSnapshot().snapshotId();
+
+            Table table = loadTable(tableName);
+            List<FileScanTask> tasks = new ArrayList<>();
+            try (CloseableIterable<FileScanTask> planned = table.newScan().planFiles()) {
+                planned.forEach(tasks::add);
+            }
+            assertEquals(tasks.size(), 1, "expected the insert to produce exactly one data file");
+            // Remove 'two' and 'four'.
+            deleteWithDeletionVector(table, tasks.get(0), ImmutableList.of(1L, 3L));
+            long toSnapshotId = loadTable(tableName).currentSnapshot().snapshotId();
+
+            // The vector is applied on the ordinary read path, so the rows really are gone.
+            assertQuery("SELECT id FROM " + tableName + " ORDER BY id", "VALUES 1, 3");
+
+            assertEquals(computeActual(changes(tableName, fromSnapshotId, toSnapshotId)).getRowCount(), 2);
+            assertQuery(
+                    changes(tableName, fromSnapshotId, toSnapshotId) + " ORDER BY id",
+                    "VALUES (2, 'two', 'DELETE'), (4, 'four', 'DELETE')");
+        }
+        finally {
+            dropTable(tableName);
+        }
+    }
+
+    /**
+     * The changelog table is readable over a range holding a deletion vector.
+     * <p>
+     * It is the same planning problem as the change set, reached by a different door: a scan of
+     * {@code table$changelog} went straight to Iceberg's changelog scan, so any range containing a
+     * row-level delete, update or merge made the table unreadable rather than merely incomplete.
+     */
+    @Test
+    public void testChangelogTableOverADeletionVectorRange()
+            throws Exception
+    {
+        String tableName = "test_changelog_table_dv";
+        try {
+            assertUpdate("CREATE TABLE " + tableName + " (id integer, value varchar) WITH (\"format-version\" = '3')");
+            assertUpdate("INSERT INTO " + tableName + " VALUES (1, 'one'), (2, 'two'), (3, 'three')", 3);
+            long fromSnapshotId = loadTable(tableName).currentSnapshot().snapshotId();
+
+            // Remove 'two'.
+            replaceDeletionVector(tableName, ImmutableList.of(1L));
+            long toSnapshotId = loadTable(tableName).currentSnapshot().snapshotId();
+
+            assertQuery(
+                    format("SELECT operation, rowdata.id, rowdata.value FROM \"%s@%s$changelog@%s\"",
+                            tableName, fromSnapshotId, toSnapshotId),
+                    "VALUES ('DELETE', 2, 'two')");
+        }
+        finally {
+            dropTable(tableName);
+        }
+    }
+
+    /**
+     * The cost estimate has to answer for a range holding a deletion vector too. It cannot be
+     * taken from Iceberg's changelog scan, which throws while planning such a range, and the
+     * throw is an {@link UnsupportedOperationException} that the estimator does not catch -- so
+     * getting this wrong surfaces as a failed query, not as a missing estimate.
+     */
+    @Test
+    public void testChangeSetSizeIsEstimatedForADeletionVectorRange()
+            throws Exception
+    {
+        String tableName = "test_change_set_size_dv";
+        try {
+            assertUpdate("CREATE TABLE " + tableName + " (id integer, value varchar) WITH (\"format-version\" = '3')");
+            assertUpdate("INSERT INTO " + tableName + " VALUES (1, 'one'), (2, 'two'), (3, 'three')", 3);
+
+            ConnectorTableVersion recordedVersion;
+            TransactionId recordedTransaction = getQueryRunner().getTransactionManager().beginTransaction(false);
+            try {
+                Session recordedSession = metadataSession(recordedTransaction);
+                recordedVersion = getQueryRunner().getMetadata()
+                        .getCurrentTableVersion(recordedSession, getTableHandle(tableName, recordedSession)).get();
+            }
+            finally {
+                getQueryRunner().getTransactionManager().asyncAbort(recordedTransaction);
+            }
+
+            replaceDeletionVector(tableName, ImmutableList.of(1L));
+
+            TransactionId refreshTransaction = getQueryRunner().getTransactionManager().beginTransaction(false);
+            try {
+                Session refreshSession = metadataSession(refreshTransaction);
+                Metadata metadata = getQueryRunner().getMetadata();
+                TableHandle tableHandle = getTableHandle(tableName, refreshSession);
+                ConnectorTableVersion refreshVersion = metadata.getCurrentTableVersion(refreshSession, tableHandle).get();
+
+                OptionalLong estimate = metadata.estimateChangeSetSize(refreshSession, tableHandle, recordedVersion, refreshVersion);
+                assertTrue(estimate.isPresent(), "expected an estimate for a range holding a deletion vector");
+                // One position marked, so one row reported.
+                assertEquals(estimate.getAsLong(), 1L);
+            }
+            finally {
+                getQueryRunner().getTransactionManager().asyncAbort(refreshTransaction);
+            }
+        }
+        finally {
+            dropTable(tableName);
+        }
+    }
+
+    /**
+     * A second removal in the same range must not re-report what the first one removed. Iceberg
+     * defines the rows a snapshot took away as the ones its own delete files mark minus the ones
+     * the delete files already in effect had removed, and a reader that merged the two sets would
+     * report the earlier rows again at the later snapshot.
+     */
+    @Test
+    public void testSystemChangesDoesNotRepeatAnEarlierRemoval()
+            throws Exception
+    {
+        String tableName = "test_system_changes_dv_twice";
+        try {
+            assertUpdate("CREATE TABLE " + tableName + " (id integer, value varchar) WITH (\"format-version\" = '3')");
+            assertUpdate("INSERT INTO " + tableName + " VALUES (1, 'one'), (2, 'two'), (3, 'three'), (4, 'four')", 4);
+
+            // 'one' goes before the range starts, so it must not be reported at all.
+            replaceDeletionVector(tableName, ImmutableList.of(0L));
+            long fromSnapshotId = loadTable(tableName).currentSnapshot().snapshotId();
+            // 'three' goes inside the range. The replacing vector still covers 'one', because a
+            // vector holds every deleted position of its data file rather than only the new ones.
+            replaceDeletionVector(tableName, ImmutableList.of(0L, 2L));
+            long toSnapshotId = loadTable(tableName).currentSnapshot().snapshotId();
+
+            assertQuery("SELECT id FROM " + tableName + " ORDER BY id", "VALUES 2, 4");
+
+            assertEquals(computeActual(changes(tableName, fromSnapshotId, toSnapshotId)).getRowCount(), 1);
+            assertQuery(
+                    changes(tableName, fromSnapshotId, toSnapshotId),
+                    "VALUES (3, 'three', 'DELETE')");
+        }
+        finally {
+            dropTable(tableName);
+        }
+    }
+
+    /**
+     * An insertion and a vector-based removal in one range. Both have to be reported, and the
+     * removal must not spill onto the newly added file.
+     */
+    @Test
+    public void testSystemChangesOverInsertAndDeletionVector()
+            throws Exception
+    {
+        String tableName = "test_system_changes_mixed";
+        try {
+            assertUpdate("CREATE TABLE " + tableName + " (id integer, value varchar) WITH (\"format-version\" = '3')");
+            assertUpdate("INSERT INTO " + tableName + " VALUES (1, 'one'), (2, 'two')", 2);
+            long fromSnapshotId = loadTable(tableName).currentSnapshot().snapshotId();
+
+            Table table = loadTable(tableName);
+            List<FileScanTask> tasks = new ArrayList<>();
+            try (CloseableIterable<FileScanTask> planned = table.newScan().planFiles()) {
+                planned.forEach(tasks::add);
+            }
+            // Remove 'one', at position 0 of the file that already existed.
+            deleteWithDeletionVector(table, tasks.get(0), ImmutableList.of(0L));
+            assertUpdate("INSERT INTO " + tableName + " VALUES (3, 'three')", 1);
+            long toSnapshotId = loadTable(tableName).currentSnapshot().snapshotId();
+
+            assertQuery("SELECT id FROM " + tableName + " ORDER BY id", "VALUES 2, 3");
+
+            assertEquals(computeActual(changes(tableName, fromSnapshotId, toSnapshotId)).getRowCount(), 2);
+            assertQuery(
+                    changes(tableName, fromSnapshotId, toSnapshotId) + " ORDER BY id",
+                    "VALUES (1, 'one', 'DELETE'), (3, 'three', 'INSERT')");
+        }
+        finally {
+            dropTable(tableName);
+        }
+    }
+
+    private String changes(String tableName, long fromSnapshotId, long toSnapshotId)
+    {
+        return format(
+                "SELECT id, value, change_kind FROM TABLE(system.builtin.changes('%s.%s.%s', %s, %s))",
+                ICEBERG_CATALOG,
+                TEST_SCHEMA,
+                tableName,
+                fromSnapshotId,
+                toSnapshotId);
     }
 
     private Session metadataSession(TransactionId transactionId)
@@ -605,6 +855,34 @@ public class TestIcebergV3
         table.newRowDelta()
                 .addDeletes(writeDeletionVector(table, task, positions))
                 .commit();
+    }
+
+    /**
+     * Commits a vector listing {@code positions}, replacing any vector already covering the data
+     * file. Iceberg permits at most one vector per data file and rejects a second as a concurrent
+     * write, so the positions given here are the complete set of deleted positions, not an
+     * addition to what a previous vector held.
+     */
+    private void replaceDeletionVector(String tableName, List<Long> positions)
+            throws Exception
+    {
+        Table table = loadTable(tableName);
+        List<FileScanTask> tasks = new ArrayList<>();
+        try (CloseableIterable<FileScanTask> planned = table.newScan().planFiles()) {
+            planned.forEach(tasks::add);
+        }
+        assertEquals(tasks.size(), 1, "expected exactly one data file");
+        FileScanTask task = tasks.get(0);
+
+        DeleteFile replacement = writeDeletionVector(table, task, positions);
+        org.apache.iceberg.RowDelta rowDelta = table.newRowDelta();
+        // Iceberg rejects adding a vector for a data file that already has one, unless the
+        // validation window is bounded: left unbounded it walks the whole history and reads the
+        // vector this commit is replacing as a concurrent write. Starting at the current snapshot
+        // leaves no room for a concurrent commit, which is true here.
+        rowDelta.validateFromSnapshot(table.currentSnapshot().snapshotId());
+        task.deletes().forEach(rowDelta::removeDeletes);
+        rowDelta.addDeletes(replacement).commit();
     }
 
     private DeleteFile writeDeletionVector(Table table, FileScanTask task, List<Long> positions)

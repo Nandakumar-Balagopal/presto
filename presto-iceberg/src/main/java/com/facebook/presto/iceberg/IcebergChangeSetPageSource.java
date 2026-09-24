@@ -26,6 +26,7 @@ import com.facebook.presto.spi.ColumnHandle;
 import com.facebook.presto.spi.ConnectorPageSource;
 import com.facebook.presto.spi.ConnectorSession;
 import com.facebook.presto.spi.ConnectorSplit;
+import com.facebook.presto.spi.ConnectorSplitSource;
 import com.facebook.presto.spi.PrestoException;
 import com.google.common.collect.ImmutableList;
 import io.airlift.slice.Slices;
@@ -41,6 +42,7 @@ import static com.facebook.presto.spi.ConnectorSplitSource.ConnectorSplitBatch;
 import static com.facebook.presto.spi.SplitContext.NON_CACHEABLE;
 import static com.facebook.presto.spi.StandardErrorCode.GENERIC_INTERNAL_ERROR;
 import static com.facebook.presto.spi.connector.NotPartitionedPartitionHandle.NOT_PARTITIONED;
+import static com.google.common.base.Verify.verify;
 import static java.util.Objects.requireNonNull;
 
 /**
@@ -51,7 +53,7 @@ import static java.util.Objects.requireNonNull;
 class IcebergChangeSetPageSource
         implements ChangeKindPageSource
 {
-    private final ChangelogSplitSource splitSource;
+    private final ConnectorSplitSource splitSource;
     private final IcebergPageSourceProvider pageSourceProvider;
     private final ConnectorSession session;
     private final IcebergTableLayoutHandle layout;
@@ -74,11 +76,31 @@ class IcebergChangeSetPageSource
             IcebergTableLayoutHandle layout,
             List<IcebergColumnHandle> projectedColumns)
     {
-        this.splitSource = new ChangelogSplitSource(
-                requireNonNull(session, "session is null"),
-                requireNonNull(typeManager, "typeManager is null"),
-                requireNonNull(table, "table is null"),
-                requireNonNull(scan, "scan is null"));
+        this(
+                session,
+                pageSourceProvider,
+                new ChangelogSplitSource(
+                        requireNonNull(session, "session is null"),
+                        requireNonNull(typeManager, "typeManager is null"),
+                        requireNonNull(table, "table is null"),
+                        requireNonNull(scan, "scan is null")),
+                layout,
+                projectedColumns);
+    }
+
+    /**
+     * Reads a change set from a split source built elsewhere. Iceberg's changelog scan refuses to
+     * plan a snapshot range holding a delete file, so the splits covering such a range have to be
+     * planned here and handed in.
+     */
+    public IcebergChangeSetPageSource(
+            ConnectorSession session,
+            IcebergPageSourceProvider pageSourceProvider,
+            ConnectorSplitSource splitSource,
+            IcebergTableLayoutHandle layout,
+            List<IcebergColumnHandle> projectedColumns)
+    {
+        this.splitSource = requireNonNull(splitSource, "splitSource is null");
         this.pageSourceProvider = requireNonNull(pageSourceProvider, "pageSourceProvider is null");
         this.session = session;
         this.layout = requireNonNull(layout, "layout is null");
@@ -176,6 +198,9 @@ class IcebergChangeSetPageSource
             return false;
         }
 
+        // One split is requested and one is read. A source returning more would have the surplus
+        // discarded silently, so say so rather than lose rows.
+        verify(batch.getSplits().size() == 1, "change set split source returned %s splits for a batch of one", batch.getSplits().size());
         ConnectorSplit connectorSplit = batch.getSplits().get(0);
         IcebergSplit changelogSplit = (IcebergSplit) connectorSplit;
         changeKind = changelogSplit.getChangelogSplitInfo()
@@ -238,6 +263,7 @@ class IcebergChangeSetPageSource
                 java.util.Optional.empty(),
                 split.getDataSequenceNumber(),
                 split.getFirstRowId(),
-                split.getAffinitySchedulingFileSectionSize());
+                split.getAffinitySchedulingFileSectionSize(),
+                split.getRetainedDeletes());
     }
 }

@@ -29,6 +29,12 @@ import static com.google.common.collect.ImmutableList.toImmutableList;
 
 public class ChangelogUtil
 {
+    /**
+     * The changelog column holding the row itself, as a row whose fields carry the base table's
+     * column names.
+     */
+    public static final String CHANGELOG_ROW_COLUMN_NAME = "rowdata";
+
     private ChangelogUtil() {}
 
     @FunctionalInterface

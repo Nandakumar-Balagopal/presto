@@ -35,6 +35,7 @@ import com.facebook.presto.hive.HivePartition;
 import com.facebook.presto.hive.NodeVersion;
 import com.facebook.presto.hive.PartitionSet;
 import com.facebook.presto.hive.UnknownTableTypeException;
+import com.facebook.presto.iceberg.changelog.ChangeSetSplitSource;
 import com.facebook.presto.iceberg.changelog.ChangelogOperation;
 import com.facebook.presto.iceberg.changelog.ChangelogUtil;
 import com.facebook.presto.iceberg.procedure.context.IcebergCommonProcedureContext;
@@ -249,6 +250,8 @@ import static com.facebook.presto.iceberg.IcebergUtil.getSnapshotIdTimeOperator;
 import static com.facebook.presto.iceberg.IcebergUtil.getSortFields;
 import static com.facebook.presto.iceberg.IcebergUtil.getTableComment;
 import static com.facebook.presto.iceberg.IcebergUtil.opsFromTable;
+import static com.facebook.presto.iceberg.IcebergUtil.rangeAddsDeleteFiles;
+import static com.facebook.presto.iceberg.IcebergUtil.removalsAreRecoverable;
 import static com.facebook.presto.iceberg.IcebergUtil.resolveSnapshotIdByName;
 import static com.facebook.presto.iceberg.IcebergUtil.supportsRowLineage;
 import static com.facebook.presto.iceberg.IcebergUtil.toHiveColumns;
@@ -276,6 +279,7 @@ import static com.facebook.presto.iceberg.TypeConverter.toIcebergType;
 import static com.facebook.presto.iceberg.TypeConverter.toPrestoType;
 import static com.facebook.presto.iceberg.changelog.ChangelogOperation.UPDATE_AFTER;
 import static com.facebook.presto.iceberg.changelog.ChangelogOperation.UPDATE_BEFORE;
+import static com.facebook.presto.iceberg.changelog.ChangelogUtil.CHANGELOG_ROW_COLUMN_NAME;
 import static com.facebook.presto.iceberg.changelog.ChangelogUtil.getRowTypeFromColumnMeta;
 import static com.facebook.presto.iceberg.optimizer.IcebergPlanOptimizer.getEnforcedColumns;
 import static com.facebook.presto.iceberg.util.StatisticsUtil.calculateBaseTableStatistics;
@@ -1456,8 +1460,29 @@ public abstract class IcebergAbstractMetadata
         List<IcebergColumnHandle> columns = projectedDataColumns.stream()
                 .map(IcebergColumnHandle.class::cast)
                 .collect(toImmutableList());
+        // Projecting either delete-marker column turns delete files from something that removes
+        // rows into something that labels them: the reader stops filtering and instead reports
+        // every row with a flag saying whether a delete file covers it. A change set read that way
+        // would report the rows that survived a delete as though they were the deleted ones, which
+        // is wrong in the worst available fashion -- quietly, and inverted. Refuse instead.
+        if (columns.contains(IS_DELETED_COLUMN_HANDLE) || columns.contains(DELETE_FILE_PATH_COLUMN_HANDLE)) {
+            throw new PrestoException(NOT_SUPPORTED, "Row-level change tracking cannot project the $deleted or $delete_file_path column");
+        }
         TupleDomain<IcebergColumnHandle> icebergFilter = filter.transform(IcebergColumnHandle.class::cast);
         IcebergTableHandle targetTableHandle = getTableHandle(session, icebergTableHandle.getSchemaTableName(), Optional.of(to));
+
+        if (rangeAddsDeleteFiles(icebergTable, fromSnapshotId, toSnapshotId)) {
+            // Iceberg's changelog scan cannot plan any part of such a range: it throws
+            // UnsupportedOperationException as soon as it meets a snapshot carrying delete
+            // manifests. So the whole range is planned here instead.
+            return new IcebergChangeSetPageSource(
+                    session,
+                    pageSourceProvider,
+                    new ChangeSetSplitSource(session, typeManager, icebergTable, fromSnapshotId, toSnapshotId),
+                    createChangeSetLayout(targetTableHandle, icebergTable, columns, icebergFilter),
+                    columns);
+        }
+
         IncrementalChangelogScan scan = icebergTable.newIncrementalChangelogScan()
                 .metricsReporter(new RuntimeStatsMetricsReporter(session.getRuntimeStats()))
                 .fromSnapshotExclusive(fromSnapshotId)
@@ -1478,6 +1503,64 @@ public abstract class IcebergAbstractMetadata
      * only added data. Anything else -- a delete, an overwrite, a compaction rewrite -- can remove
      * rows, which a predicate over the row-lineage sequence number cannot detect.
      */
+    /**
+     * Where the engine can read the rows a range removed: the changelog relation for exactly that
+     * range.
+     * <p>
+     * Resolved here rather than by the engine, and from the same pair of snapshot ids the gate above
+     * just decided on. The engine has no way to address this relation -- how a version range is
+     * named is the connector's business -- and were it to derive the upper bound itself, a commit
+     * landing in between would leave it reading a different range than the one the predicate was
+     * built for, silently missing whatever the gap removed.
+     */
+    private ChangedRowsPredicate.RemovedRows removedRowsSource(
+            ConnectorSession session,
+            SchemaTableName baseTable,
+            long recordedSnapshotId,
+            long currentSnapshotId)
+    {
+        SchemaTableName changelog = new SchemaTableName(
+                baseTable.getSchemaName(),
+                format("%s@%s$changelog@%s", baseTable.getTableName(), recordedSnapshotId, currentSnapshotId));
+        return new ChangedRowsPredicate.RemovedRows(
+                getTableHandle(session, changelog, Optional.empty()),
+                CHANGELOG_ROW_COLUMN_NAME);
+    }
+
+    /**
+     * An upper bound on the rows a range reports, read from the manifests without opening a data
+     * file: the rows each snapshot added, the rows it dropped with a whole data file, and the
+     * positions its delete files mark. A bound rather than a count, because a delete file may mark
+     * positions an earlier one had already marked, and those are reported once.
+     * <p>
+     * A compaction is skipped, as it is when the splits are planned -- it moves rows between files
+     * without changing one, and V3 row lineage survives the move.
+     */
+    private static OptionalLong estimateChangeSetSizeFromSnapshots(Table table, long fromSnapshotId, long toSnapshotId)
+    {
+        long rowCount = 0;
+        try {
+            for (Snapshot snapshot : SnapshotUtil.ancestorsBetween(table, toSnapshotId, fromSnapshotId)) {
+                if (DataOperations.REPLACE.equals(snapshot.operation())) {
+                    continue;
+                }
+                for (DataFile file : snapshot.addedDataFiles(table.io())) {
+                    rowCount = Math.addExact(rowCount, file.recordCount());
+                }
+                for (DataFile file : snapshot.removedDataFiles(table.io())) {
+                    rowCount = Math.addExact(rowCount, file.recordCount());
+                }
+                for (org.apache.iceberg.DeleteFile file : snapshot.addedDeleteFiles(table.io())) {
+                    rowCount = Math.addExact(rowCount, file.recordCount());
+                }
+            }
+        }
+        catch (ArithmeticException e) {
+            return OptionalLong.empty();
+        }
+        return OptionalLong.of(rowCount);
+    }
+
     private static boolean isAppendOnlyRange(Table table, long fromSnapshotId, long toSnapshotId)
     {
         if (toSnapshotId == 0 || fromSnapshotId == toSnapshotId) {
@@ -1532,6 +1615,12 @@ public abstract class IcebergAbstractMetadata
         }
         if (!isAncestorOf(icebergTable, toSnapshotId, fromSnapshotId)) {
             return OptionalLong.empty();
+        }
+
+        if (rangeAddsDeleteFiles(icebergTable, fromSnapshotId, toSnapshotId)) {
+            // planFiles() throws on such a range, so the estimate comes from the manifests the
+            // same way the splits do.
+            return estimateChangeSetSizeFromSnapshots(icebergTable, fromSnapshotId, toSnapshotId);
         }
 
         IncrementalChangelogScan scan = icebergTable.newIncrementalChangelogScan()
@@ -2431,15 +2520,15 @@ public abstract class IcebergAbstractMetadata
             // Row-level change tracking requires a concrete recorded snapshot. A base table
             // with no recorded snapshot continues through the existing partition path.
             //
-            // It also requires the range to contain nothing but appends. The changed-rows predicate
-            // identifies changed rows by their sequence number, which can only find rows that are
-            // still there, so a row removed in the range is invisible to it. A group that lost all
-            // its rows would keep its stale aggregate: the engine excludes it from the fresh branch
-            // and has nothing to recompute it from. Withholding the predicate here leaves such a
-            // range to the partition-level path, which derives changed partitions from metadata and
-            // does see the removals.
+            // The changed-rows predicate identifies changed rows by their sequence number, so it can
+            // only find rows that are still there: a row the range removed is invisible to it. An
+            // append-only range has no removals to miss. Any other range is offered only when the
+            // removals can be read from somewhere else, which is what removedRows carries -- without
+            // it a group that lost all its rows would keep its stale aggregate, excluded from the
+            // fresh branch with nothing to recompute it from.
+            boolean appendOnly = isAppendOnlyRange(baseIcebergTable, recordedSnapshotId, currentSnapshotId);
             if (recordedSnapshotId != 0 && supportsRowLineage(baseIcebergTable)
-                    && isAppendOnlyRange(baseIcebergTable, recordedSnapshotId, currentSnapshotId)) {
+                    && (appendOnly || removalsAreRecoverable(baseIcebergTable, recordedSnapshotId, currentSnapshotId))) {
                 Snapshot recordedSnapshot = baseIcebergTable.snapshot(recordedSnapshotId);
                 if (recordedSnapshot != null) {
                     ConnectorTableVersion recordedVersion = new ConnectorTableVersion(
@@ -2453,10 +2542,11 @@ public abstract class IcebergAbstractMetadata
                                     LAST_UPDATED_SEQUENCE_NUMBER_COLUMN_HANDLE,
                                     Domain.create(ValueSet.ofRanges(Range.greaterThan(BigintType.BIGINT, recordedSnapshot.sequenceNumber())), false)))),
                             refreshBound,
-                            // Every snapshot in the range was checked to be an APPEND above, which
-                            // adds data files and removes none, so nothing present at the recorded
-                            // version was modified or removed.
-                            true));
+                            // An append adds data files and removes none, so on such a range nothing
+                            // present at the recorded version was modified or removed. On any other
+                            // range something was, and the consumer has to account for it.
+                            appendOnly,
+                            appendOnly ? Optional.empty() : Optional.of(removedRowsSource(session, baseTable, recordedSnapshotId, currentSnapshotId))));
                 }
             }
 
@@ -2864,6 +2954,28 @@ public abstract class IcebergAbstractMetadata
                     long baseHeadId = baseHeadSnapshot.snapshotId();
                     String recordedSnapshotStr = viewProperties.get(key);
                     long recordedSnapshotId = recordedSnapshotStr == null ? 0L : parseLong(recordedSnapshotStr);
+                    // The head read just above is a fresh one, taken as the refresh commits, while
+                    // the plan that produced these rows read the base at the snapshot it was pinned
+                    // to when the statement was analysed. A commit landing in between is therefore
+                    // recorded as refreshed without having been read, and the rows it added are
+                    // never picked up: the next refresh sees them as older than the watermark.
+                    //
+                    // Bounded refresh does not have this problem. chooseTargetSnapshot with a limit
+                    // present returns an index counted up from the watermark, which is stable however
+                    // far the base has since advanced -- only the unbounded default below races.
+                    //
+                    // Closing it means recording the snapshot the plan actually read, which lives in
+                    // the base table handles of the plan rather than here; the refresh handle would
+                    // have to carry it from planning, the way the refresh-scope predicate already
+                    // does. Writing the head read at begin instead would only narrow the window,
+                    // since analysis is earlier still.
+                    //
+                    // Today this is masked rather than harmless: a group the refresh skips keeps a
+                    // stale stored value, and the fresh branch passes it through the anti-join
+                    // unchanged. It is corrected only incidentally, when that group is next affected
+                    // and recomputed from the current base. Any future maintenance that treats the
+                    // stored value as an arithmetic operand rather than recomputing it loses that
+                    // accidental repair, and depends on this being fixed first.
                     long newWatermark = chooseTargetSnapshot(baseIcebergTable, recordedSnapshotId, maxSnapshotsPerRefresh)
                             .orElse(baseHeadId);
                     properties.put(key, Long.toString(newWatermark));

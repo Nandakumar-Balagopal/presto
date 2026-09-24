@@ -829,7 +829,14 @@ public class IcebergPageSourceProvider
         // add any additional columns which may need to be read from storage
         // by delete filters
         boolean equalityDeletesRequired = table.getIcebergTableName().getTableType() == IcebergTableType.DATA;
-        requiredColumnsForDeletes(tableSchema, partitionSpec, split.getDeletes(), equalityDeletesRequired)
+        // The retained files need the row position just as much as the excluded ones -- a split
+        // that only retains would otherwise be read without it and the filter would have no
+        // channel to test.
+        requiredColumnsForDeletes(
+                tableSchema,
+                partitionSpec,
+                ImmutableList.<DeleteFile>builder().addAll(split.getDeletes()).addAll(split.getRetainedDeletes()).build(),
+                equalityDeletesRequired)
                 .stream()
                 .filter(not(icebergColumns::contains))
                 .forEach(columnsToReadFromStorage::add);
@@ -952,6 +959,7 @@ public class IcebergPageSourceProvider
                     tableSchema,
                     split.getPath(),
                     deletesToApply,
+                    split.getRetainedDeletes(),
                     partitionInsertingPageSource.getRowPositionDelegate().getStartRowPosition(),
                     partitionInsertingPageSource.getRowPositionDelegate().getEndRowPosition(),
                     storeDeleteFilePath);
@@ -1027,6 +1035,7 @@ public class IcebergPageSourceProvider
             Schema schema,
             String dataFilePath,
             List<DeleteFile> deleteFiles,
+            List<DeleteFile> retainedDeleteFiles,
             Optional<Long> startRowPosition,
             Optional<Long> endRowPosition,
             boolean storeDeleteFilePath)
@@ -1120,7 +1129,53 @@ public class IcebergPageSourceProvider
             filters.add(new PositionDeleteFilter(deletedRows, null));
         }
 
+        if (!retainedDeleteFiles.isEmpty()) {
+            filters.add(retainedRowsFilter(session, retainedDeleteFiles, targetPath, deleteColumns, deleteDomain));
+        }
+
         return filters;
+    }
+
+    /**
+     * A filter keeping exactly the rows that {@code retainedDeleteFiles} mark as deleted.
+     * <p>
+     * One filter over the union of their positions, not one per file: the filters returned here are
+     * combined with AND, so a row marked by one file and not another would be dropped, when being
+     * marked by any of them is what qualifies it. The caller composes this with the ordinary
+     * filters built above, which yields "removed by one of these, and not already removed by an
+     * earlier one" -- the rows a snapshot took away.
+     * <p>
+     * An empty union still produces a filter, and that filter admits nothing. Returning no filter
+     * would read the data file whole and report every row as removed.
+     */
+    private DeleteFilter retainedRowsFilter(
+            ConnectorSession session,
+            List<DeleteFile> retainedDeleteFiles,
+            Slice targetPath,
+            List<IcebergColumnHandle> deleteColumns,
+            TupleDomain<IcebergColumnHandle> deleteDomain)
+    {
+        LongBitmapDataProvider retainedRows = new Roaring64Bitmap();
+        for (DeleteFile delete : retainedDeleteFiles) {
+            if (delete.content() != POSITION_DELETES) {
+                // An equality delete names values rather than positions, so which rows it removed
+                // cannot be recovered without evaluating it against the data as it then stood.
+                throw new PrestoException(NOT_SUPPORTED, format(
+                        "Recovering the rows removed by %s is not supported", delete.content()));
+            }
+            if (delete.format() == com.facebook.presto.iceberg.FileFormat.PUFFIN) {
+                applyDeletionVector(readDeletionVectorBlob(session, delete), delete, retainedRows);
+            }
+            else {
+                try (ConnectorPageSource pageSource = openDeletes(session, delete, deleteColumns, deleteDomain)) {
+                    readPositionDeletes(pageSource, targetPath, retainedRows);
+                }
+                catch (IOException e) {
+                    throw new PrestoException(ICEBERG_CANNOT_OPEN_SPLIT, format("Cannot open Iceberg delete file: %s", delete.path()), e);
+                }
+            }
+        }
+        return new PositionDeleteFilter(retainedRows, null, true);
     }
 
     /**

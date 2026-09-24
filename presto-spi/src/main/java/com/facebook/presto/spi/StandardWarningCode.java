@@ -37,7 +37,10 @@ public enum StandardWarningCode
      * which reports that row-level could not be used at all: a cost rejection is the mechanism
      * working as intended, and is worth surfacing only so the choice is visible.
      */
-    MATERIALIZED_VIEW_ROW_LEVEL_REJECTED_ON_COST(0x0000_0016),
+    // 0x0000_0016 belongs to FORCE_PUSH_PARTIAL_AGGREGATION_UNKNOWN_STATS upstream. This branch
+    // predates it, so nothing here collides yet and nothing can notice: the clash appears only
+    // when the two meet, as a duplicate code in a file neither side touched knowingly.
+    MATERIALIZED_VIEW_ROW_LEVEL_REJECTED_ON_COST(0x0000_0017),
     /**/;
     private final WarningCode warningCode;
 

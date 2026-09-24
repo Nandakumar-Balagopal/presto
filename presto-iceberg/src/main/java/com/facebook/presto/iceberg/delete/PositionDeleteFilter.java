@@ -36,17 +36,36 @@ public final class PositionDeleteFilter
     private final ImmutableLongBitmapDataProvider deletedRows;
     @Nullable
     private final String deleteFilePath;
+    private final boolean retainDeletedRows;
 
     public PositionDeleteFilter(ImmutableLongBitmapDataProvider deletedRows, @Nullable String deleteFilePath)
     {
+        this(deletedRows, deleteFilePath, false);
+    }
+
+    /**
+     * @param retainDeletedRows keep the marked rows and discard the rest, rather than the other
+     *         way round. A delete file records which rows of a data file went away, and the data
+     *         file still holds them, so reading it this way reproduces rows that are no longer
+     *         anywhere in the table. Both senses are needed in the same read: the rows a snapshot
+     *         removed are the ones its own delete files mark and that no earlier delete file had
+     *         already removed, which is a retaining filter over the one and an ordinary filter
+     *         over the others.
+     */
+    public PositionDeleteFilter(ImmutableLongBitmapDataProvider deletedRows, @Nullable String deleteFilePath, boolean retainDeletedRows)
+    {
         this.deletedRows = requireNonNull(deletedRows, "deletedRows is null");
         this.deleteFilePath = deleteFilePath;
+        this.retainDeletedRows = retainDeletedRows;
     }
 
     @Override
     public RowPredicate createPredicate(List<IcebergColumnHandle> columns)
     {
         int filePosChannel = rowPositionChannel(columns);
+        if (retainDeletedRows) {
+            return (page, position) -> deletedRows.contains(BIGINT.getLong(page.getBlock(filePosChannel), position));
+        }
         return (page, position) -> {
             long filePos = BIGINT.getLong(page.getBlock(filePosChannel), position);
             return !deletedRows.contains(filePos);

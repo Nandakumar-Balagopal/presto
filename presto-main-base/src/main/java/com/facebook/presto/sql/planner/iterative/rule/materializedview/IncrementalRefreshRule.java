@@ -191,8 +191,17 @@ public class IncrementalRefreshRule
         // Iceberg treats the refresh as a full rewrite and overwrites the storage table by
         // alwaysTrue(), which would discard every group the row-level delta did not recompute.
         // Writing a partial delta is only safe once the commit replaces partitions instead.
+        // A range that removed rows is refused outright. Recomputing only the changed groups is
+        // committed by replacing the partitions of the files the refresh writes, which can correct
+        // a group and can add one, but has no way to take one away -- so a group whose every row
+        // was removed would survive the commit with its old value, and the watermark would advance
+        // past the removal that should have emptied it. Reading such a range while it is stale is
+        // fine, because a read commits nothing; it is the commit that cannot represent a deletion.
+        boolean rangeRemovedRows = status.getChangedRowsPredicates().values().stream()
+                .anyMatch(changedRows -> changedRows.getRemovedRows().isPresent());
         if (status.hasRowLevelChanges()
                 && status.hasPartitionRefreshData()
+                && !rangeRemovedRows
                 && RowLevelRefreshEnablement.isEnabled(session, materializedViewDefinition.get().getRowLevelIncrementalRefresh())) {
             if (DifferentialPlanRewriter.rowLevelReplacementIsSafe(
                     metadata,
