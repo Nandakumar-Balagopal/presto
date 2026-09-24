@@ -197,6 +197,7 @@ import static com.facebook.presto.iceberg.IcebergColumnHandle.PATH_COLUMN_HANDLE
 import static com.facebook.presto.iceberg.IcebergColumnHandle.PATH_COLUMN_METADATA;
 import static com.facebook.presto.iceberg.IcebergColumnHandle.ROW_ID_COLUMN_HANDLE;
 import static com.facebook.presto.iceberg.IcebergColumnHandle.ROW_ID_COLUMN_METADATA;
+import static com.facebook.presto.iceberg.IcebergErrorCode.ICEBERG_CANNOT_OPEN_SPLIT;
 import static com.facebook.presto.iceberg.IcebergErrorCode.ICEBERG_COMMIT_ERROR;
 import static com.facebook.presto.iceberg.IcebergErrorCode.ICEBERG_INCOMPATIBLE_COLUMN_TYPE;
 import static com.facebook.presto.iceberg.IcebergErrorCode.ICEBERG_INVALID_FORMAT_VERSION;
@@ -232,6 +233,7 @@ import static com.facebook.presto.iceberg.IcebergTableProperties.SORTED_BY_PROPE
 import static com.facebook.presto.iceberg.IcebergTableType.CHANGELOG;
 import static com.facebook.presto.iceberg.IcebergTableType.DATA;
 import static com.facebook.presto.iceberg.IcebergTableType.EQUALITY_DELETES;
+import static com.facebook.presto.iceberg.IcebergUtil.MAX_FORMAT_VERSION_FOR_ROW_LEVEL_DELETE;
 import static com.facebook.presto.iceberg.IcebergUtil.MAX_FORMAT_VERSION_FOR_ROW_LEVEL_OPERATIONS;
 import static com.facebook.presto.iceberg.IcebergUtil.MIN_FORMAT_VERSION_FOR_DELETE;
 import static com.facebook.presto.iceberg.IcebergUtil.MIN_FORMAT_VERSION_FOR_ROW_LINEAGE;
@@ -814,6 +816,7 @@ public abstract class IcebergAbstractMetadata
         ImmutableSet.Builder<String> writtenFiles = ImmutableSet.builder();
         ImmutableSet.Builder<String> referencedDataFiles = ImmutableSet.builder();
         commitTasks.forEach(task -> handleTask(task, icebergTable, rowDelta, writtenFiles, referencedDataFiles));
+        removeSupersededDeletionVectors(icebergTable, commitTasks, rowDelta);
 
         rowDelta.validateDataFilesExist(referencedDataFiles.build());
         if (this.transactionContext.getIsolationLevel() == SERIALIZABLE) {
@@ -867,6 +870,27 @@ public abstract class IcebergAbstractMetadata
         }
     }
 
+    /**
+     * Records where a deletion vector's blob sits, for a task that wrote one.
+     * <p>
+     * Without this the committed entry names only the Puffin file, and a reader has no way to tell
+     * which of its blobs belongs to which data file -- so it would have to parse the footer, and
+     * merging every blob it found would delete rows of data files that were never touched. Iceberg
+     * also requires a V3 position delete to be a vector, so an entry missing these is rejected at
+     * commit rather than read back wrongly.
+     */
+    private static void withDeletionVectorLocation(FileMetadata.Builder builder, CommitTaskData task)
+    {
+        if (!task.getContentOffset().isPresent()) {
+            return;
+        }
+        builder.withContentOffset(task.getContentOffset().getAsLong())
+                .withContentSizeInBytes(task.getContentSizeInBytes()
+                        .orElseThrow(() -> new VerifyException("Deletion vector has a content offset but no size")))
+                .withReferencedDataFile(task.getReferencedDataFile()
+                        .orElseThrow(() -> new VerifyException("Deletion vector does not name the data file it applies to")));
+    }
+
     private void handleFinishPositionDeletes(CommitTaskData task, PartitionSpec partitionSpec, Type[] partitionColumnTypes, RowDelta rowDelta, ImmutableSet.Builder<String> writtenFiles, ImmutableSet.Builder<String> referencedDataFiles)
     {
         FileMetadata.Builder deleteBuilder = FileMetadata.deleteFileBuilder(partitionSpec)
@@ -875,6 +899,7 @@ public abstract class IcebergAbstractMetadata
                 .ofPositionDeletes()
                 .withFileSizeInBytes(task.getFileSizeInBytes())
                 .withMetrics(task.getMetrics().metrics());
+        withDeletionVectorLocation(deleteBuilder, task);
 
         if (!partitionSpec.fields().isEmpty()) {
             String partitionDataJson = task.getPartitionDataJson()
@@ -885,6 +910,47 @@ public abstract class IcebergAbstractMetadata
         rowDelta.addDeletes(deleteBuilder.build());
         writtenFiles.add(task.getPath());
         task.getReferencedDataFile().ifPresent(referencedDataFiles::add);
+    }
+
+    /**
+     * Removes the deletion vector this commit supersedes, if the data file already had one.
+     * <p>
+     * Iceberg permits at most one vector per data file and refuses a commit that would leave two
+     * ("Can't index multiple DVs"), so a second delete against the same file has to retire the
+     * first. The vector being added already carries the retired one's positions forward -- the
+     * sink seeds itself from them -- so nothing is lost by dropping it here.
+     */
+    private static void removeSupersededDeletionVectors(
+            Table icebergTable,
+            List<CommitTaskData> commitTasks,
+            RowDelta rowDelta)
+    {
+        Set<String> replacedDataFiles = commitTasks.stream()
+                .filter(task -> task.getContentOffset().isPresent())
+                .map(CommitTaskData::getReferencedDataFile)
+                .filter(Optional::isPresent)
+                .map(Optional::get)
+                .collect(toImmutableSet());
+        if (replacedDataFiles.isEmpty()) {
+            return;
+        }
+
+        Set<String> written = commitTasks.stream().map(CommitTaskData::getPath).collect(toImmutableSet());
+        try (CloseableIterable<FileScanTask> tasks = icebergTable.newScan().planFiles()) {
+            for (FileScanTask task : tasks) {
+                for (org.apache.iceberg.DeleteFile existing : task.deletes()) {
+                    String referenced = existing.referencedDataFile();
+                    if (referenced != null
+                            && replacedDataFiles.contains(referenced)
+                            && !written.contains(existing.path().toString())) {
+                        rowDelta.removeDeletes(existing);
+                    }
+                }
+            }
+        }
+        catch (IOException e) {
+            throw new PrestoException(ICEBERG_CANNOT_OPEN_SPLIT, "Cannot enumerate the deletion vectors this commit replaces", e);
+        }
     }
 
     private void handleFinishData(CommitTaskData task, Table icebergTable, PartitionSpec partitionSpec, Type[] partitionColumnTypes, Consumer<DataFile> dataFileConsumer, ImmutableSet.Builder<String> writtenFiles)
@@ -1795,7 +1861,7 @@ public abstract class IcebergAbstractMetadata
         if (formatVersion < MIN_FORMAT_VERSION_FOR_DELETE) {
             throw new PrestoException(NOT_SUPPORTED, format("This connector only supports delete where one or more partitions are deleted entirely for table versions older than %d", MIN_FORMAT_VERSION_FOR_DELETE));
         }
-        if (formatVersion > MAX_FORMAT_VERSION_FOR_ROW_LEVEL_OPERATIONS) {
+        if (formatVersion > MAX_FORMAT_VERSION_FOR_ROW_LEVEL_DELETE) {
             throw new PrestoException(NOT_SUPPORTED,
                     format("Iceberg table updates for format version %s are not supported yet", formatVersion));
         }
@@ -1833,6 +1899,7 @@ public abstract class IcebergAbstractMetadata
                     .withFileSizeInBytes(task.getFileSizeInBytes())
                     .withFormat(FileFormat.fromString(task.getFileFormat().name()))
                     .withMetrics(task.getMetrics().metrics());
+            withDeletionVectorLocation(builder, task);
 
             if (!spec.fields().isEmpty()) {
                 String partitionDataJson = task.getPartitionDataJson()
@@ -1848,6 +1915,8 @@ public abstract class IcebergAbstractMetadata
                 referencedDataFiles.add(task.getReferencedDataFile().get());
             }
         }
+
+        removeSupersededDeletionVectors(icebergTable, commitTasks, rowDelta);
 
         if (!referencedDataFiles.isEmpty()) {
             rowDelta.validateDataFilesExist(referencedDataFiles);
