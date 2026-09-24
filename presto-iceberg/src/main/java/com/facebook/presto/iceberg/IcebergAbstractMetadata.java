@@ -2954,6 +2954,28 @@ public abstract class IcebergAbstractMetadata
                     long baseHeadId = baseHeadSnapshot.snapshotId();
                     String recordedSnapshotStr = viewProperties.get(key);
                     long recordedSnapshotId = recordedSnapshotStr == null ? 0L : parseLong(recordedSnapshotStr);
+                    // The head read just above is a fresh one, taken as the refresh commits, while
+                    // the plan that produced these rows read the base at the snapshot it was pinned
+                    // to when the statement was analysed. A commit landing in between is therefore
+                    // recorded as refreshed without having been read, and the rows it added are
+                    // never picked up: the next refresh sees them as older than the watermark.
+                    //
+                    // Bounded refresh does not have this problem. chooseTargetSnapshot with a limit
+                    // present returns an index counted up from the watermark, which is stable however
+                    // far the base has since advanced -- only the unbounded default below races.
+                    //
+                    // Closing it means recording the snapshot the plan actually read, which lives in
+                    // the base table handles of the plan rather than here; the refresh handle would
+                    // have to carry it from planning, the way the refresh-scope predicate already
+                    // does. Writing the head read at begin instead would only narrow the window,
+                    // since analysis is earlier still.
+                    //
+                    // Today this is masked rather than harmless: a group the refresh skips keeps a
+                    // stale stored value, and the fresh branch passes it through the anti-join
+                    // unchanged. It is corrected only incidentally, when that group is next affected
+                    // and recomputed from the current base. Any future maintenance that treats the
+                    // stored value as an arithmetic operand rather than recomputing it loses that
+                    // accidental repair, and depends on this being fixed first.
                     long newWatermark = chooseTargetSnapshot(baseIcebergTable, recordedSnapshotId, maxSnapshotsPerRefresh)
                             .orElse(baseHeadId);
                     properties.put(key, Long.toString(newWatermark));
