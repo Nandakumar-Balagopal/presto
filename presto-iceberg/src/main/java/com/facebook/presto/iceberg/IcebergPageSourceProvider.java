@@ -45,6 +45,7 @@ import com.facebook.presto.iceberg.changelog.ChangelogPageSource;
 import com.facebook.presto.iceberg.delete.DeleteFile;
 import com.facebook.presto.iceberg.delete.DeleteFilter;
 import com.facebook.presto.iceberg.delete.IcebergDeletePageSink;
+import com.facebook.presto.iceberg.delete.IcebergDeletionVectorPageSink;
 import com.facebook.presto.iceberg.delete.PositionDeleteFilter;
 import com.facebook.presto.iceberg.delete.RowPredicate;
 import com.facebook.presto.memory.context.AggregatedMemoryContext;
@@ -70,6 +71,7 @@ import com.facebook.presto.parquet.cache.ParquetMetadataSource;
 import com.facebook.presto.parquet.predicate.Predicate;
 import com.facebook.presto.parquet.reader.ParquetReader;
 import com.facebook.presto.spi.ColumnHandle;
+import com.facebook.presto.spi.ConnectorPageSink;
 import com.facebook.presto.spi.ConnectorPageSource;
 import com.facebook.presto.spi.ConnectorSession;
 import com.facebook.presto.spi.ConnectorSplit;
@@ -156,6 +158,8 @@ import static com.facebook.presto.iceberg.IcebergErrorCode.ICEBERG_MISSING_COLUM
 import static com.facebook.presto.iceberg.IcebergErrorCode.ICEBERG_MISSING_DATA;
 import static com.facebook.presto.iceberg.IcebergMetadataColumn.MERGE_PARTITION_DATA;
 import static com.facebook.presto.iceberg.IcebergOrcColumn.ROOT_COLUMN_ID;
+import static com.facebook.presto.iceberg.IcebergUtil.FORMAT_VERSION_PROPERTY;
+import static com.facebook.presto.iceberg.IcebergUtil.MIN_FORMAT_VERSION_FOR_DELETION_VECTORS;
 import static com.facebook.presto.iceberg.IcebergUtil.getColumns;
 import static com.facebook.presto.iceberg.IcebergUtil.getLocationProvider;
 import static com.facebook.presto.iceberg.IcebergUtil.getShallowWrappedIcebergTable;
@@ -192,6 +196,7 @@ import static com.google.common.collect.ImmutableSet.toImmutableSet;
 import static com.google.common.collect.Maps.uniqueIndex;
 import static io.airlift.slice.Slices.EMPTY_SLICE;
 import static io.airlift.slice.Slices.utf8Slice;
+import static java.lang.Integer.parseInt;
 import static java.lang.Math.toIntExact;
 import static java.lang.String.format;
 import static java.time.ZoneOffset.UTC;
@@ -935,17 +940,33 @@ public class IcebergPageSourceProvider
         verify(storageProperties.isPresent(), "storageProperties are null");
 
         LocationProvider locationProvider = getLocationProvider(table.getSchemaTableName(), outputPath.get(), storageProperties.get());
-        Supplier<IcebergDeletePageSink> deleteSinkSupplier = () -> new IcebergDeletePageSink(
-                partitionSpec,
-                split.getPartitionDataJson(),
-                locationProvider,
-                fileWriterFactory,
-                hdfsEnvironment,
-                hdfsContext,
-                jsonCodec,
-                session,
-                split.getPath(),
-                split.getFileFormat());
+        // From format version 3 a row-level delete has to be recorded as a deletion vector:
+        // Iceberg refuses a commit carrying a positional delete file against such a table. Below
+        // that version the reverse holds, and it refuses a vector -- so the format version, not a
+        // preference, decides which sink is correct.
+        int tableFormatVersion = parseInt(storageProperties.get().getOrDefault(FORMAT_VERSION_PROPERTY, "2"));
+        Supplier<ConnectorPageSink> deleteSinkSupplier = tableFormatVersion >= MIN_FORMAT_VERSION_FOR_DELETION_VECTORS
+                ? () -> new IcebergDeletionVectorPageSink(
+                        partitionSpec,
+                        split.getPartitionDataJson(),
+                        locationProvider,
+                        hdfsEnvironment,
+                        hdfsContext,
+                        jsonCodec,
+                        session,
+                        split.getPath(),
+                        alreadyDeletedPositions(session, split))
+                : () -> new IcebergDeletePageSink(
+                        partitionSpec,
+                        split.getPartitionDataJson(),
+                        locationProvider,
+                        fileWriterFactory,
+                        hdfsEnvironment,
+                        hdfsContext,
+                        jsonCodec,
+                        session,
+                        split.getPath(),
+                        split.getFileFormat());
         boolean storeDeleteFilePath = icebergColumns.contains(DELETE_FILE_PATH_COLUMN_HANDLE);
         Supplier<List<DeleteFilter>> deleteFilters = memoize(() -> {
             // If equality deletes are optimized into a join they don't need to be applied here
@@ -1176,6 +1197,25 @@ public class IcebergPageSourceProvider
             }
         }
         return new PositionDeleteFilter(retainedRows, null, true);
+    }
+
+    /**
+     * The positions a vector already in effect for this split's data file marks.
+     * <p>
+     * A vector replaces its predecessor rather than adding to it, and Iceberg allows only one per
+     * data file, so a second delete against the same file has to write a vector covering both its
+     * own positions and the earlier ones. Reading them here rather than in the sink keeps the blob
+     * read in the one place that knows how to do it.
+     */
+    private Roaring64Bitmap alreadyDeletedPositions(ConnectorSession session, IcebergSplit split)
+    {
+        Roaring64Bitmap positions = new Roaring64Bitmap();
+        for (DeleteFile delete : split.getDeletes()) {
+            if (delete.content() == POSITION_DELETES && delete.format() == com.facebook.presto.iceberg.FileFormat.PUFFIN) {
+                applyDeletionVector(readDeletionVectorBlob(session, delete), delete, positions);
+            }
+        }
+        return positions;
     }
 
     /**

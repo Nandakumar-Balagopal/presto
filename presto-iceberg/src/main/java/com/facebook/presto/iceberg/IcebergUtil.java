@@ -238,8 +238,24 @@ import static org.apache.iceberg.types.Type.TypeID.FIXED;
 public final class IcebergUtil
 {
     private static final Logger log = Logger.get(IcebergUtil.class);
+    /** The property key under which the table format version is exposed to readers and writers. */
+    public static final String FORMAT_VERSION_PROPERTY = "format-version";
     public static final int MIN_FORMAT_VERSION_FOR_DELETE = 2;
+    /**
+     * From this version on, Iceberg requires a row-level delete to be recorded as a deletion
+     * vector and refuses a commit carrying a positional delete file. Below it the reverse holds.
+     */
+    public static final int MIN_FORMAT_VERSION_FOR_DELETION_VECTORS = 3;
     public static final int MAX_FORMAT_VERSION_FOR_ROW_LEVEL_OPERATIONS = 2;
+    /**
+     * The highest format version whose row-level deletes the connector can write, which is ahead of
+     * what it can update or merge. A delete only has to record which rows went away, and it now
+     * does that as a deletion vector; an update or a merge additionally writes replacement rows,
+     * whose row lineage and change-set representation are not implemented for this version yet.
+     * Kept separate so DELETE is not held back by them, and so neither is quietly enabled by a
+     * change meant for the other.
+     */
+    public static final int MAX_FORMAT_VERSION_FOR_ROW_LEVEL_DELETE = 3;
     public static final int MIN_FORMAT_VERSION_FOR_ROW_LINEAGE = 3;
     public static final int MAX_FORMAT_VERSION_FOR_METADATA_TABLES = 3;
     public static final int MAX_SUPPORTED_FORMAT_VERSION = 3;
@@ -674,10 +690,28 @@ public final class IcebergUtil
                 .build();
     }
 
+    /**
+     * The table's properties, with its format version included.
+     * <p>
+     * The format version lives in table metadata rather than in the property map, so a reader
+     * handed only the properties cannot tell which version it is looking at. That matters on the
+     * write side: from version 3 a row-level delete has to be a deletion vector and below it a
+     * positional delete file, and the properties are all a worker has to decide by. Adding it here
+     * keeps that decision from silently defaulting to the wrong one.
+     * <p>
+     * An explicit property of the same name wins, so a caller can still say what it means.
+     */
     public static Optional<Map<String, String>> tryGetProperties(Table table)
     {
         try {
-            return Optional.ofNullable(table.properties());
+            Map<String, String> properties = table.properties();
+            if (properties == null || properties.containsKey(FORMAT_VERSION_PROPERTY) || !(table instanceof BaseTable)) {
+                return Optional.ofNullable(properties);
+            }
+            return Optional.of(ImmutableMap.<String, String>builder()
+                    .putAll(properties)
+                    .put(FORMAT_VERSION_PROPERTY, String.valueOf(((BaseTable) table).operations().current().formatVersion()))
+                    .build());
         }
         catch (TableNotFoundException e) {
             log.warn(String.format("Unable to fetch properties for table %s: %s", table.name(), e.getMessage()));

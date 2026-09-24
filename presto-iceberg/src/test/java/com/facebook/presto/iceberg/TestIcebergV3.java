@@ -545,6 +545,12 @@ public class TestIcebergV3
         return resolver.getTableHandle(new QualifiedObjectName(session.getCatalog().get(), session.getSchema().get(), tableName)).get();
     }
 
+    /**
+     * Superseded by {@link #testRowLevelDeleteOnV3Table}: a row-level delete on a V3 table is
+     * supported now that the connector writes a deletion vector. Kept as the boundary between what
+     * the delete path can do and what the update and merge paths still cannot -- their gate is
+     * deliberately separate, so that enabling one does not quietly enable the others.
+     */
     @Test
     public void testDeleteOnV3TableNotSupported()
     {
@@ -556,7 +562,10 @@ public class TestIcebergV3
                     + " VALUES (1, 'Alice', 100.0), (2, 'Bob', 200.0), (3, 'Charlie', 300.0)", 3);
             assertQuery("SELECT * FROM " + tableName + " ORDER BY id",
                     "VALUES (1, 'Alice', 100.0), (2, 'Bob', 200.0), (3, 'Charlie', 300.0)");
-            assertThatThrownBy(() -> getQueryRunner().execute("DELETE FROM " + tableName + " WHERE id = 1"))
+            // A delete is supported; an update of the same table is not.
+            assertUpdate("DELETE FROM " + tableName + " WHERE id = 1", 1);
+            assertQuery("SELECT count(*) FROM " + tableName, "VALUES 2");
+            assertThatThrownBy(() -> getQueryRunner().execute("UPDATE " + tableName + " SET name = 'x' WHERE id = 2"))
                     .hasMessageContaining("Iceberg table updates for format version 3 are not supported yet");
         }
         finally {
