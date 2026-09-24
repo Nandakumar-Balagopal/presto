@@ -768,6 +768,45 @@ public class TestIcebergRowLevelRefreshEdgeCases
         }
     }
 
+    /**
+     * Successive refreshes converge: each one picks up what was appended since the last.
+     * <p>
+     * Deliberately NOT a test of the refresh watermark being recorded from the version the refresh
+     * read rather than from the base's head at commit time. Those two versions only differ when
+     * something lands in the base while the refresh is running, and this harness runs a refresh to
+     * completion before the next statement, so both readings agree and the distinction is
+     * invisible. Sabotaging the watermark logic leaves this test passing -- it is an invariant
+     * worth holding, not a guard on that fix.
+     */
+    @Test
+    public void testSuccessiveRefreshesConverge()
+    {
+        String base = "watermark_base";
+        String view = "watermark_mv";
+        try {
+            create(base, "region varchar, amount bigint", "ARRAY['region']");
+            assertQuerySucceeds("INSERT INTO " + base + " VALUES ('NA', 10)");
+            createView(view, base, "ARRAY['region']", "SELECT region, SUM(amount) AS total FROM " + base + " GROUP BY region");
+            refreshExpectingFallback(view);
+            assertViewMatchesBase(
+                    "SELECT region, total FROM " + view + " ORDER BY region",
+                    "SELECT region, SUM(amount) FROM " + base + " GROUP BY region ORDER BY region");
+
+            // Two appends, refreshed one at a time.
+            assertQuerySucceeds("INSERT INTO " + base + " VALUES ('NA', 1)");
+            refreshExpectingRowLevel(view);
+            assertQuerySucceeds("INSERT INTO " + base + " VALUES ('NA', 100)");
+            refreshExpectingRowLevel(view);
+
+            assertViewMatchesBase(
+                    "SELECT region, total FROM " + view + " ORDER BY region",
+                    "SELECT region, SUM(amount) FROM " + base + " GROUP BY region ORDER BY region");
+        }
+        finally {
+            drop(view, base);
+        }
+    }
+
     // ------------------------------------------------------------- boilerplate
 
     private void run(

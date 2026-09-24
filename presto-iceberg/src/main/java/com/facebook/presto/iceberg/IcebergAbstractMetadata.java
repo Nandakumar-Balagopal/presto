@@ -2900,6 +2900,12 @@ public abstract class IcebergAbstractMetadata
         boolean fullRefreshRequired = !status.isFullyMaterialized()
                 && !status.hasPartitionRefreshData();
 
+        // Decided here, not when the refresh commits. Reading the base table's head again at
+        // commit time would record a version this refresh never read -- a base that advanced while
+        // the refresh was running would have its new rows marked as already refreshed, and the next
+        // refresh would see them as older than the watermark and skip them for good.
+        Map<String, String> baseTableWatermarks = refreshTargetVersions(session, materializedViewName);
+
         return new IcebergInsertTableHandle(
                 storageTableHandle.getSchemaName(),
                 storageTableHandle.getIcebergTableName(),
@@ -2912,7 +2918,54 @@ public abstract class IcebergAbstractMetadata
                 storageTable.properties(),
                 getSupportedSortFields(storageTable.schema(), storageTable.sortOrder()),
                 Optional.of(materializedViewName),
-                fullRefreshRequired);
+                fullRefreshRequired,
+                ImmutableList.of(),
+                Optional.empty(),
+                baseTableWatermarks);
+    }
+
+    /**
+     * The version of each base table this refresh will bring the view up to, keyed by the view
+     * property it is recorded under.
+     * <p>
+     * Read once, here, so that the version the refresh is planned against and the version it
+     * records are the same. A bounded refresh names a target below the head; an unbounded one takes
+     * the head as it stands now.
+     */
+    private Map<String, String> refreshTargetVersions(ConnectorSession session, SchemaTableName materializedViewName)
+    {
+        Optional<IcebergViewMetadata> viewMetadata = getViewMetadata(session, materializedViewName);
+        Optional<MaterializedViewDefinition> definition = getMaterializedView(session, materializedViewName);
+        if (!viewMetadata.isPresent() || !definition.isPresent()) {
+            return ImmutableMap.of();
+        }
+        Map<String, String> viewProperties = viewMetadata.get().getProperties();
+        if (isTimestampBasedStalenessEnabled(viewProperties)) {
+            // Staleness is judged by timestamp, so no per-base version is recorded at all.
+            return ImmutableMap.of();
+        }
+
+        OptionalInt maxSnapshotsPerRefresh = resolveMaxSnapshotsPerRefresh(session, viewProperties);
+        ImmutableMap.Builder<String, String> targets = ImmutableMap.builder();
+        for (SchemaTableName baseTable : definition.get().getBaseTables()) {
+            try {
+                Table baseIcebergTable = getIcebergTable(session, baseTable);
+                String key = getBaseTableViewPropertyName(baseTable);
+                Snapshot head = baseIcebergTable.currentSnapshot();
+                if (head == null) {
+                    targets.put(key, "0");
+                    continue;
+                }
+                String recordedSnapshotStr = viewProperties.get(key);
+                long recordedSnapshotId = recordedSnapshotStr == null ? 0L : parseLong(recordedSnapshotStr);
+                targets.put(key, Long.toString(chooseTargetSnapshot(baseIcebergTable, recordedSnapshotId, maxSnapshotsPerRefresh)
+                        .orElse(head.snapshotId())));
+            }
+            catch (Exception e) {
+                log.warn(e, "Failed to resolve the refresh target for base table %s of materialized view %s", baseTable, materializedViewName);
+            }
+        }
+        return targets.build();
     }
 
     @Override
@@ -3007,8 +3060,18 @@ public abstract class IcebergAbstractMetadata
         Map<String, String> viewProperties = viewMetadata.get().getProperties();
         boolean useTimestampBasedStaleness = isTimestampBasedStalenessEnabled(viewProperties);
 
-        // Only capture base table snapshots if NOT using timestamp-based staleness
-        if (!useTimestampBasedStaleness && definition.isPresent()) {
+        // The versions this refresh was planned against, decided when it began. Recorded verbatim:
+        // re-deriving them now would read a base table that may have advanced since, and mark rows
+        // this refresh never read as already refreshed -- the next refresh would then see them as
+        // older than the watermark and skip them for good.
+        Map<String, String> plannedWatermarks = icebergInsertHandle.getBaseTableWatermarks();
+        if (!useTimestampBasedStaleness && !plannedWatermarks.isEmpty()) {
+            properties.putAll(plannedWatermarks);
+        }
+        else if (!useTimestampBasedStaleness && definition.isPresent()) {
+            // No planned versions came through, so fall back to reading the head. This is the old
+            // behaviour and carries the skew described above; it is reached only by a caller that
+            // did not go through beginRefreshMaterializedView.
             OptionalInt maxSnapshotsPerRefresh = resolveMaxSnapshotsPerRefresh(session, viewProperties);
 
             for (SchemaTableName baseTable : definition.get().getBaseTables()) {

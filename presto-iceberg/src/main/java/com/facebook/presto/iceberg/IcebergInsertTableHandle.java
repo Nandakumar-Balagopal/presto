@@ -20,6 +20,7 @@ import com.facebook.presto.spi.SchemaTableName;
 import com.fasterxml.jackson.annotation.JsonCreator;
 import com.fasterxml.jackson.annotation.JsonProperty;
 import com.google.common.collect.ImmutableList;
+import com.google.common.collect.ImmutableMap;
 
 import java.util.List;
 import java.util.Map;
@@ -33,6 +34,7 @@ public class IcebergInsertTableHandle
 {
     private final List<String> insertedColumns;
     private final Optional<ConnectorDeleteTableHandle> affectedRowsDeleteHandle;
+    private final Map<String, String> baseTableWatermarks;
 
     public IcebergInsertTableHandle(
             String schemaName,
@@ -104,7 +106,7 @@ public class IcebergInsertTableHandle
     {
         this(schemaName, tableName, schema, partitionSpec, inputColumns, outputPath,
                 fileFormat, compressionCodec, storageProperties, sortOrder, materializedViewName,
-                fullRefreshRequired, insertedColumns, Optional.empty());
+                fullRefreshRequired, insertedColumns, Optional.empty(), ImmutableMap.of());
     }
 
     @JsonCreator
@@ -122,7 +124,8 @@ public class IcebergInsertTableHandle
             @JsonProperty("materializedViewName") Optional<SchemaTableName> materializedViewName,
             @JsonProperty("fullRefreshRequired") boolean fullRefreshRequired,
             @JsonProperty("insertedColumns") List<String> insertedColumns,
-            @JsonProperty("affectedRowsDeleteHandle") Optional<ConnectorDeleteTableHandle> affectedRowsDeleteHandle)
+            @JsonProperty("affectedRowsDeleteHandle") Optional<ConnectorDeleteTableHandle> affectedRowsDeleteHandle,
+            @JsonProperty("baseTableWatermarks") Map<String, String> baseTableWatermarks)
     {
         super(
                 schemaName,
@@ -139,6 +142,23 @@ public class IcebergInsertTableHandle
                 fullRefreshRequired);
         this.insertedColumns = ImmutableList.copyOf(requireNonNull(insertedColumns, "insertedColumns is null"));
         this.affectedRowsDeleteHandle = requireNonNull(affectedRowsDeleteHandle, "affectedRowsDeleteHandle is null");
+        this.baseTableWatermarks = ImmutableMap.copyOf(requireNonNull(baseTableWatermarks, "baseTableWatermarks is null"));
+    }
+
+    /**
+     * The base-table versions this refresh is bringing the view up to, keyed by the view property
+     * each is recorded under.
+     * <p>
+     * Captured when the refresh begins rather than read again when it commits. The two are not the
+     * same: a base table that advances while the refresh is running would otherwise be recorded at
+     * a version this refresh never read, and the rows in between would be permanently skipped --
+     * the next refresh sees them as older than the watermark. Empty for a write that is not a
+     * materialized view refresh.
+     */
+    @JsonProperty
+    public Map<String, String> getBaseTableWatermarks()
+    {
+        return baseTableWatermarks;
     }
 
     @JsonProperty
