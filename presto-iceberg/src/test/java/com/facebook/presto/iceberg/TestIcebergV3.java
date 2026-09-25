@@ -573,6 +573,41 @@ public class TestIcebergV3
         }
     }
 
+    /**
+     * Row lineage stays readable after a delete that removes more than one row.
+     * <p>
+     * Reading it derives {@code _row_id} from the file's own values or from the row position, and
+     * deciding which needs to know whether the file supplied any nulls. That check read position
+     * zero of a run-length block directly, which an emptied page does not have -- so a delete
+     * whose vector cleared every row of a page failed the query outright rather than returning no
+     * rows. A single-row delete leaves survivors in the page and never reaches it.
+     * <p>
+     * Worth a test of its own because {@code _row_id} is how a changed row is identified at all:
+     * losing the ability to read it takes row-level refresh with it.
+     */
+    @Test
+    public void testRowLineageSurvivesAMultiRowDelete()
+    {
+        String tableName = "test_v3_lineage_multi_delete";
+        try {
+            assertUpdate("CREATE TABLE " + tableName
+                    + " (id integer, value varchar) WITH (\"format-version\" = '3', \"write.delete.mode\" = 'merge-on-read')");
+            assertUpdate("INSERT INTO " + tableName + " VALUES (1, 'one'), (2, 'two'), (3, 'three'), (4, 'four')", 4);
+            assertQuery("SELECT id, \"_row_id\" FROM " + tableName + " ORDER BY id",
+                    "VALUES (1, 0), (2, 1), (3, 2), (4, 3)");
+
+            assertUpdate("DELETE FROM " + tableName + " WHERE id IN (2, 3)", 2);
+
+            assertQuery("SELECT id, value FROM " + tableName + " ORDER BY id", "VALUES (1, 'one'), (4, 'four')");
+            // The surviving ids keep the identities they were written with, which is the point of
+            // row lineage: they are not renumbered to close the gap the delete left.
+            assertQuery("SELECT id, \"_row_id\" FROM " + tableName + " ORDER BY id", "VALUES (1, 0), (4, 3)");
+        }
+        finally {
+            dropTable(tableName);
+        }
+    }
+
     @Test
     public void testTruncateV3Table()
     {
