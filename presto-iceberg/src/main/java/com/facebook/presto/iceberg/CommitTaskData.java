@@ -46,7 +46,11 @@ public class CommitTaskData
             @JsonProperty("path") String path,
             @JsonProperty("fileSizeInBytes") long fileSizeInBytes,
             @JsonProperty("metrics") MetricsWrapper metrics,
-            @JsonProperty("partitionSpecJson") int partitionSpecId,
+            // Named for the key actually on the wire. This read "partitionSpecJson", a key nothing
+            // ever writes: the value round-tripped anyway, under the parameter's own name, so the
+            // annotation described a format that did not exist rather than breaking the one that
+            // did. Corrected so the declaration cannot be read as evidence of either.
+            @JsonProperty("partitionSpecId") int partitionSpecId,
             @JsonProperty("partitionDataJson") Optional<String> partitionDataJson,
             @JsonProperty("fileFormat") FileFormat fileFormat,
             @JsonProperty("referencedDataFile") String referencedDataFile,
