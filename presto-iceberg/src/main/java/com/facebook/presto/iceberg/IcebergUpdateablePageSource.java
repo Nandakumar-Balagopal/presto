@@ -29,6 +29,7 @@ import com.facebook.presto.spi.UpdatablePageSource;
 import com.google.common.collect.ImmutableList;
 import io.airlift.slice.Slice;
 import io.airlift.slice.Slices;
+import org.apache.iceberg.MetadataColumns;
 import org.apache.iceberg.Schema;
 import org.apache.iceberg.types.Types;
 import org.apache.iceberg.util.Pair;
@@ -106,6 +107,12 @@ public class IcebergUpdateablePageSource
     private final long firstRowId;
     // The output index of _last_updated_sequence_number, or -1 if not requested
     private final int lastUpdatedSeqOutputIndex;
+    // The _row_id column's index within the $row_id struct, or -1 if the struct does not carry it.
+    // Present only for an update on a row-lineage table, where the replacement row has to keep the
+    // identity of the row it replaces.
+    private final int rowLineageRowIdStructIndex;
+    // The delegate index of the _row_id column as read from the data file, or -1 if not read
+    private final int rowLineageDelegateIndex;
     // The data sequence number of the file for _last_updated_sequence_number fallback
     private final long dataSequenceNumber;
 
@@ -150,14 +157,21 @@ public class IcebergUpdateablePageSource
         Map<ColumnIdentity, Integer> columnToIndex = IntStream.range(0, delegateColumns.size())
                 .boxed()
                 .collect(toImmutableMap(index -> delegateColumns.get(index).getColumnIdentity(), identity()));
-        rowIdColumn.ifPresent(column -> {
-            List<ColumnIdentity> rowIdFields = column.getColumnIdentity().getChildren();
+        int rowIdStructIndex = -1;
+        if (rowIdColumn.isPresent()) {
+            List<ColumnIdentity> rowIdFields = rowIdColumn.get().getColumnIdentity().getChildren();
             for (int i = 0; i < rowIdFields.size(); i++) {
                 ColumnIdentity columnIdentity = rowIdFields.get(i);
-                updateRowIdChildColumnIndexes[i] = requireNonNull(columnToIndex.get(columnIdentity), () -> format("Column %s not found in requiredColumns", columnIdentity));
+                int index = i;
+                updateRowIdChildColumnIndexes[i] = requireNonNull(columnToIndex.get(columnIdentity), () -> format("Column %s not found in requiredColumns", rowIdFields.get(index)));
                 columnIdToRowIdColumnIndex.put(columnIdentity, i);
+                if (columnIdentity.getId() == MetadataColumns.ROW_ID.fieldId()) {
+                    rowIdStructIndex = i;
+                }
             }
-        });
+        }
+        this.rowLineageRowIdStructIndex = rowIdStructIndex;
+        this.rowLineageDelegateIndex = rowIdStructIndex < 0 ? -1 : updateRowIdChildColumnIndexes[rowIdStructIndex];
 
         if (!updatedColumns.isEmpty()) {
             for (int columnIndex = 0; columnIndex < updatedColumns.size(); columnIndex++) {
@@ -195,8 +209,12 @@ public class IcebergUpdateablePageSource
         this.rowLineageRowIdOutputIndex = rowLineageIdx;
         this.lastUpdatedSeqOutputIndex = lastUpdatedSeqIdx;
 
-        // Find the delegate index for ROW_POSITION (needed for _row_id = firstRowId + _pos fallback)
-        if (rowLineageIdx >= 0 && firstRowId >= 0) {
+        // Find the delegate index for ROW_POSITION (needed for _row_id = firstRowId + _pos fallback).
+        // Wanted whether _row_id is being output or carried through the $row_id struct into an
+        // update: without it the fallback cannot run, and a row whose id is implicit -- every row
+        // of an ordinary inserted file -- would reach the write path as a null and be given a new
+        // identity instead of keeping its own.
+        if ((rowLineageIdx >= 0 || rowLineageRowIdStructIndex >= 0) && firstRowId >= 0) {
             for (int i = 0; i < delegateColumns.size(); i++) {
                 if (delegateColumns.get(i).isRowPositionColumn()) {
                     rowPosIdx = i;
@@ -319,7 +337,10 @@ public class IcebergUpdateablePageSource
 
         Set<ColumnIdentity> updatedColumnFieldIds = columnIdentityToUpdatedColumnIndex.keySet();
         List<Types.NestedField> tableColumns = tableSchema.columns();
-        Block[] fullPage = new Block[tableColumns.size()];
+        // One column wider on a row-lineage table, for the trailing _row_id that
+        // IcebergUtil.schemaWithMaterializedRowId adds to the schema this sink writes.
+        boolean materializeRowId = rowLineageRowIdStructIndex >= 0;
+        Block[] fullPage = new Block[tableColumns.size() + (materializeRowId ? 1 : 0)];
         // Build a page that will contain the values of the updated rows. The rows stored in the "fullPage" include both updated and non-updated field values.
         for (int targetChannel = 0; targetChannel < tableColumns.size(); targetChannel++) {
             Types.NestedField column = tableColumns.get(targetChannel);
@@ -330,6 +351,11 @@ public class IcebergUpdateablePageSource
             else {
                 fullPage[targetChannel] = rowIdColumns.getField(columnIdToRowIdColumnIndex.get(columnIdentity));
             }
+        }
+        if (materializeRowId) {
+            // The id of the row being replaced, already resolved against first_row_id by
+            // setRowIdBlock, so the replacement row keeps the identity rather than earning a new one.
+            fullPage[tableColumns.size()] = rowIdColumns.getField(rowLineageRowIdStructIndex);
         }
         updatedRowPageSink.appendPage(new Page(page.getPositionCount(), fullPage));
     }
@@ -380,7 +406,7 @@ public class IcebergUpdateablePageSource
         if ((updateRowIdColumnIndex == -1 || updatedColumns.isEmpty()) && !isMergeTargetTable) {
             loopFunc = (channel) -> {
                 if (channel == rowLineageRowIdOutputIndex) {
-                    fullPage[channel] = computeRowIdBlock(page);
+                    fullPage[channel] = computeRowIdBlock(page, outputColumnToDelegateMapping[rowLineageRowIdOutputIndex]);
                 }
                 else if (channel == lastUpdatedSeqOutputIndex) {
                     fullPage[channel] = computeLastUpdatedSeqBlock(page);
@@ -393,14 +419,23 @@ public class IcebergUpdateablePageSource
         else {
             rowIdFields = new Block[updateRowIdChildColumnIndexes.length];
             for (int childIndex = 0; childIndex < updateRowIdChildColumnIndexes.length; childIndex++) {
-                rowIdFields[childIndex] = page.getBlock(updateRowIdChildColumnIndexes[childIndex]);
+                if (childIndex == rowLineageRowIdStructIndex) {
+                    // Resolved rather than passed through. The file column is null for every row
+                    // whose id is implicit, which is all of them in an ordinary inserted file, and
+                    // handing those nulls to the write path would surrender the identity instead of
+                    // preserving it.
+                    rowIdFields[childIndex] = computeRowIdBlock(page, rowLineageDelegateIndex);
+                }
+                else {
+                    rowIdFields[childIndex] = page.getBlock(updateRowIdChildColumnIndexes[childIndex]);
+                }
             }
             loopFunc = (channel) -> {
                 if (channel == updateRowIdColumnIndex) {
                     fullPage[channel] = RowBlock.fromFieldBlocks(page.getPositionCount(), Optional.empty(), rowIdFields);
                 }
                 else if (channel == rowLineageRowIdOutputIndex) {
-                    fullPage[channel] = computeRowIdBlock(page);
+                    fullPage[channel] = computeRowIdBlock(page, outputColumnToDelegateMapping[rowLineageRowIdOutputIndex]);
                 }
                 else if (channel == lastUpdatedSeqOutputIndex) {
                     fullPage[channel] = computeLastUpdatedSeqBlock(page);
@@ -424,7 +459,7 @@ public class IcebergUpdateablePageSource
      * (per the Iceberg spec, null means "set by the commit").
      * For V1/V2 tables (firstRowId &lt; 0), returns null for all rows.
      */
-    private Block computeRowIdBlock(Page page)
+    private Block computeRowIdBlock(Page page, int fileRowIdDelegateIndex)
     {
         // V1/V2 table: return null for all rows
         if (firstRowId < 0) {
@@ -432,7 +467,7 @@ public class IcebergUpdateablePageSource
         }
 
         // Get the file-read block for _row_id
-        Block fileRowIdBlock = page.getBlock(outputColumnToDelegateMapping[rowLineageRowIdOutputIndex]);
+        Block fileRowIdBlock = page.getBlock(fileRowIdDelegateIndex);
 
         // If the file provided all non-null values, use them directly (COW-rewritten files)
         if (!hasAnyNull(fileRowIdBlock)) {

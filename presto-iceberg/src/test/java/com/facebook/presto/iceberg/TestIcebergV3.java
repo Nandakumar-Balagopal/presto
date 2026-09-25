@@ -546,27 +546,32 @@ public class TestIcebergV3
     }
 
     /**
-     * Superseded by {@link #testRowLevelDeleteOnV3Table}: a row-level delete on a V3 table is
-     * supported now that the connector writes a deletion vector. Kept as the boundary between what
-     * the delete path can do and what the update and merge paths still cannot -- their gate is
-     * deliberately separate, so that enabling one does not quietly enable the others.
+     * Delete and update against one V3 table, which is where the two write paths meet: the update
+     * rewrites a row in a file the delete's vector already partly masks, and has to both see past
+     * that vector and supersede it without undoing it.
      */
     @Test
-    public void testDeleteOnV3TableNotSupported()
+    public void testDeleteThenUpdateOnV3Table()
     {
         String tableName = "test_v3_delete";
         try {
             assertUpdate("CREATE TABLE " + tableName
-                    + " (id INTEGER, name VARCHAR, value DOUBLE) WITH (\"format-version\" = '3', \"write.delete.mode\" = 'merge-on-read')");
+                    + " (id INTEGER, name VARCHAR, value DOUBLE) WITH (\"format-version\" = '3',"
+                    + " \"write.delete.mode\" = 'merge-on-read', \"write.update.mode\" = 'merge-on-read')");
             assertUpdate("INSERT INTO " + tableName
                     + " VALUES (1, 'Alice', 100.0), (2, 'Bob', 200.0), (3, 'Charlie', 300.0)", 3);
             assertQuery("SELECT * FROM " + tableName + " ORDER BY id",
                     "VALUES (1, 'Alice', 100.0), (2, 'Bob', 200.0), (3, 'Charlie', 300.0)");
-            // A delete is supported; an update of the same table is not.
+
+            // An update after a delete has to see through the vector the delete left behind: the
+            // row it rewrites is at a position the vector does not mask, in a file it partly does.
             assertUpdate("DELETE FROM " + tableName + " WHERE id = 1", 1);
-            assertQuery("SELECT count(*) FROM " + tableName, "VALUES 2");
-            assertThatThrownBy(() -> getQueryRunner().execute("UPDATE " + tableName + " SET name = 'x' WHERE id = 2"))
-                    .hasMessageContaining("Iceberg table updates for format version 3 are not supported yet");
+            assertUpdate("UPDATE " + tableName + " SET name = 'Bobby' WHERE id = 2", 1);
+
+            assertQuery("SELECT * FROM " + tableName + " ORDER BY id",
+                    "VALUES (2, 'Bobby', 200.0), (3, 'Charlie', 300.0)");
+            // Row 2 keeps the id it was inserted with, and row 1's is not reused.
+            assertQuery("SELECT id, \"_row_id\" FROM " + tableName + " ORDER BY id", "VALUES (2, 1), (3, 2)");
         }
         finally {
             dropTable(tableName);
@@ -660,7 +665,7 @@ public class TestIcebergV3
     }
 
     @Test
-    public void testUpdateOnV3TableNotSupported()
+    public void testUpdateOnV3Table()
     {
         String tableName = "test_v3_update";
         try {
@@ -669,11 +674,125 @@ public class TestIcebergV3
             assertUpdate("INSERT INTO " + tableName
                             + " VALUES (1, 'Alice', 'active', 85.5), (2, 'Bob', 'active', 92.0), (3, 'Charlie', 'inactive', 78.3)",
                     3);
+            assertUpdate("UPDATE " + tableName + " SET status = 'updated', score = 95.0 WHERE id = 1", 1);
             assertQuery("SELECT * FROM " + tableName + " ORDER BY id",
-                    "VALUES (1, 'Alice', 'active', 85.5), (2, 'Bob', 'active', 92.0), (3, 'Charlie', 'inactive', 78.3)");
-            assertThatThrownBy(() -> getQueryRunner()
-                    .execute("UPDATE " + tableName + " SET status = 'updated', score = 95.0 WHERE id = 1"))
-                    .hasMessageContaining("Iceberg table updates for format version 3 are not supported yet");
+                    "VALUES (1, 'Alice', 'updated', 95.0), (2, 'Bob', 'active', 92.0), (3, 'Charlie', 'inactive', 78.3)");
+        }
+        finally {
+            dropTable(tableName);
+        }
+    }
+
+    /**
+     * The point of the update path on a row-lineage table: the replacement row is a different row
+     * in a different file, and has to answer to the identity of the row it replaced. Nothing else
+     * here is evidence of that -- the data assertion above passes just as well when the row is
+     * given a fresh id, which is what happens if the id is not carried through the write path.
+     */
+    @Test
+    public void testUpdateOnV3TablePreservesRowLineage()
+    {
+        String tableName = "test_v3_update_lineage";
+        try {
+            assertUpdate("CREATE TABLE " + tableName
+                    + " (id INTEGER, name VARCHAR, status VARCHAR) WITH (\"format-version\" = '3', \"write.update.mode\" = 'merge-on-read')");
+            assertUpdate("INSERT INTO " + tableName
+                    + " VALUES (1, 'Alice', 'active'), (2, 'Bob', 'active'), (3, 'Charlie', 'inactive')", 3);
+            assertQuery("SELECT id, \"_row_id\" FROM " + tableName + " ORDER BY id", "VALUES (1, 0), (2, 1), (3, 2)");
+
+            assertUpdate("UPDATE " + tableName + " SET status = 'updated' WHERE id = 2", 1);
+
+            // Row 2 keeps id 1 rather than picking up the next free id.
+            assertQuery("SELECT id, \"_row_id\" FROM " + tableName + " ORDER BY id", "VALUES (1, 0), (2, 1), (3, 2)");
+            assertQuery("SELECT id, name, status FROM " + tableName + " ORDER BY id",
+                    "VALUES (1, 'Alice', 'active'), (2, 'Bob', 'updated'), (3, 'Charlie', 'inactive')");
+        }
+        finally {
+            dropTable(tableName);
+        }
+    }
+
+    /**
+     * The other half of row lineage: the id says which row this is, the sequence number says when
+     * it last changed. Only the updated row's may advance, or a consumer diffing on the sequence
+     * number would see rows it never touched.
+     *
+     * <p>Not a guard for the row-id carry -- it passes with that reverted, since the sequence
+     * number comes from the file's own metadata either way. It guards the decision to leave
+     * {@code _last_updated_sequence_number} unmaterialized (see
+     * {@code IcebergUtil.schemaWithMaterializedRowId}): were the old value written into the
+     * replacement row, the updated row's number would not advance and this would fail.
+     * {@link #testUpdateOnV3TablePreservesRowLineage} is what guards the id.
+     */
+    @Test
+    public void testUpdateOnV3TableAdvancesOnlyTheUpdatedRowsSequenceNumber()
+    {
+        String tableName = "test_v3_update_seq";
+        try {
+            assertUpdate("CREATE TABLE " + tableName
+                    + " (id INTEGER, status VARCHAR) WITH (\"format-version\" = '3', \"write.update.mode\" = 'merge-on-read')");
+            assertUpdate("INSERT INTO " + tableName + " VALUES (1, 'active'), (2, 'active'), (3, 'active')", 3);
+            long insertSequenceNumber = (long) computeScalar("SELECT max(\"_last_updated_sequence_number\") FROM " + tableName);
+
+            assertUpdate("UPDATE " + tableName + " SET status = 'updated' WHERE id = 2", 1);
+
+            assertQuery("SELECT id, \"_last_updated_sequence_number\" - " + insertSequenceNumber + " FROM " + tableName + " ORDER BY id",
+                    "VALUES (1, 0), (2, 1), (3, 0)");
+        }
+        finally {
+            dropTable(tableName);
+        }
+    }
+
+    /**
+     * A second update reads its old id out of the first update's file, where it is materialized,
+     * rather than deriving it from a row position -- the other branch of the coalesce in
+     * {@code computeRowIdBlock}. An id that survives one update but not two would mean the written
+     * column is not being read back.
+     */
+    @Test
+    public void testSuccessiveUpdatesPreserveRowLineage()
+    {
+        String tableName = "test_v3_update_lineage_twice";
+        try {
+            assertUpdate("CREATE TABLE " + tableName
+                    + " (id INTEGER, status VARCHAR) WITH (\"format-version\" = '3', \"write.update.mode\" = 'merge-on-read')");
+            assertUpdate("INSERT INTO " + tableName + " VALUES (1, 'a'), (2, 'a'), (3, 'a')", 3);
+
+            assertUpdate("UPDATE " + tableName + " SET status = 'b' WHERE id = 2", 1);
+            assertQuery("SELECT id, \"_row_id\" FROM " + tableName + " ORDER BY id", "VALUES (1, 0), (2, 1), (3, 2)");
+
+            assertUpdate("UPDATE " + tableName + " SET status = 'c' WHERE id = 2", 1);
+            assertQuery("SELECT id, \"_row_id\" FROM " + tableName + " ORDER BY id", "VALUES (1, 0), (2, 1), (3, 2)");
+            assertQuery("SELECT id, status FROM " + tableName + " ORDER BY id", "VALUES (1, 'a'), (2, 'c'), (3, 'a')");
+        }
+        finally {
+            dropTable(tableName);
+        }
+    }
+
+    /**
+     * What the materialized view path actually consumes. An update is two physical events -- a
+     * deletion vector hiding the old row and a data file holding the new one -- and the change set
+     * has to report both, since a view keyed on the updated column has to retract the old grouping
+     * as well as accumulate the new one.
+     */
+    @Test
+    public void testChangeSetOverAV3Update()
+    {
+        String tableName = "test_v3_update_changeset";
+        try {
+            assertUpdate("CREATE TABLE " + tableName
+                    + " (id integer, value varchar) WITH (\"format-version\" = '3', \"write.update.mode\" = 'merge-on-read')");
+            assertUpdate("INSERT INTO " + tableName + " VALUES (1, 'one'), (2, 'two'), (3, 'three')", 3);
+            long fromSnapshotId = loadTable(tableName).currentSnapshot().snapshotId();
+
+            assertUpdate("UPDATE " + tableName + " SET value = 'TWO' WHERE id = 2", 1);
+            long toSnapshotId = loadTable(tableName).currentSnapshot().snapshotId();
+
+            assertQuery(
+                    changes(tableName, fromSnapshotId, toSnapshotId) + " ORDER BY value",
+                    "VALUES (2, 'TWO', 'INSERT'), (2, 'two', 'DELETE')");
         }
         finally {
             dropTable(tableName);
@@ -681,7 +800,7 @@ public class TestIcebergV3
     }
 
     @Test
-    public void testMergeOnV3TableNotSupported()
+    public void testMergeOnV3Table()
     {
         String tableName = "test_v3_merge_target";
         String sourceTable = "test_v3_merge_source";
@@ -695,11 +814,115 @@ public class TestIcebergV3
             assertQuery("SELECT * FROM " + tableName + " ORDER BY id", "VALUES (1, 'Alice', 100.0), (2, 'Bob', 200.0)");
             assertQuery("SELECT * FROM " + sourceTable + " ORDER BY id",
                     "VALUES (1, 'Alice Updated', 150.0), (3, 'Charlie', 300.0)");
-            assertThatThrownBy(() -> getQueryRunner().execute(
-                    "MERGE INTO " + tableName + " t USING " + sourceTable + " s ON t.id = s.id " +
+            assertUpdate("MERGE INTO " + tableName + " t USING " + sourceTable + " s ON t.id = s.id " +
                             "WHEN MATCHED THEN UPDATE SET name = s.name, value = s.value " +
-                            "WHEN NOT MATCHED THEN INSERT (id, name, value) VALUES (s.id, s.name, s.value)"))
-                    .hasMessageContaining("Iceberg table updates for format version 3 are not supported yet");
+                            "WHEN NOT MATCHED THEN INSERT (id, name, value) VALUES (s.id, s.name, s.value)",
+                    2);
+            assertQuery("SELECT * FROM " + tableName + " ORDER BY id",
+                    "VALUES (1, 'Alice Updated', 150.0), (2, 'Bob', 200.0), (3, 'Charlie', 300.0)");
+        }
+        finally {
+            dropTable(tableName);
+            dropTable(sourceTable);
+        }
+    }
+
+    /**
+     * Two merges touching the same data file. The second writes a deletion vector that supersedes
+     * the first's rather than adding to it, so it has to restate the position the first hid --
+     * otherwise the row the first merge replaced comes back, alongside its replacement.
+     *
+     * <p>The positions are not recoverable from the merge itself: the read side applies the vector
+     * in effect before the merge sees the rows, so the row the first merge hid never reaches the
+     * sink. They come from {@code IcebergMergeTableHandle.getDeletionVectorsInEffect()}.
+     */
+    @Test
+    public void testSuccessiveMergesDoNotResurrectEarlierDeletions()
+    {
+        String tableName = "test_v3_merge_successive";
+        String sourceTable = "test_v3_merge_successive_src";
+        try {
+            assertUpdate("CREATE TABLE " + tableName
+                    + " (id INTEGER, value VARCHAR) WITH (\"format-version\" = '3', \"write.update.mode\" = 'merge-on-read')");
+            assertUpdate("CREATE TABLE " + sourceTable + " (id INTEGER, value VARCHAR)");
+            assertUpdate("INSERT INTO " + tableName + " VALUES (1, 'a'), (2, 'a'), (3, 'a')", 3);
+            assertUpdate("INSERT INTO " + sourceTable + " VALUES (1, 'first'), (2, 'second')", 2);
+
+            assertUpdate("MERGE INTO " + tableName + " t USING " + sourceTable + " s ON t.id = s.id AND s.id = 1 " +
+                    "WHEN MATCHED THEN UPDATE SET value = s.value", 1);
+            assertQuery("SELECT id, value FROM " + tableName + " ORDER BY id",
+                    "VALUES (1, 'first'), (2, 'a'), (3, 'a')");
+
+            // Touches position 1 of the same original data file, whose position 0 is already hidden.
+            assertUpdate("MERGE INTO " + tableName + " t USING " + sourceTable + " s ON t.id = s.id AND s.id = 2 " +
+                    "WHEN MATCHED THEN UPDATE SET value = s.value", 1);
+            assertQuery("SELECT id, value FROM " + tableName + " ORDER BY id",
+                    "VALUES (1, 'first'), (2, 'second'), (3, 'a')");
+            assertQuery("SELECT count(*) FROM " + tableName, "VALUES 3");
+        }
+        finally {
+            dropTable(tableName);
+            dropTable(sourceTable);
+        }
+    }
+
+    /**
+     * Pins a known limitation rather than a desired behaviour: a matched update in a MERGE gives
+     * the replacement row a fresh {@code _row_id}, where the equivalent {@code UPDATE} preserves it
+     * ({@link #testUpdateOnV3TablePreservesRowLineage}).
+     *
+     * <p>The cause is not in the connector. The engine expands a matched update into a delete row
+     * and an insert row and nulls the row-id column on the insert half, so the sink receives an
+     * insert indistinguishable from an unmatched one and has nothing to carry forward. Fixing it
+     * means changing what the merge rewrite puts on that half, which is engine-side and shared by
+     * every connector's merge sink.
+     *
+     * <p>Here so the gap is visible and so that closing it fails this test rather than passing
+     * unnoticed. Should {@code _row_id} below become 1, lineage is being preserved: assert that
+     * instead and delete this note.
+     */
+    @Test
+    public void testMergeOnV3TableDoesNotPreserveRowLineage()
+    {
+        String tableName = "test_v3_merge_lineage_gap";
+        String sourceTable = "test_v3_merge_lineage_gap_src";
+        try {
+            assertUpdate("CREATE TABLE " + tableName
+                    + " (id INTEGER, value VARCHAR) WITH (\"format-version\" = '3', \"write.update.mode\" = 'merge-on-read')");
+            assertUpdate("CREATE TABLE " + sourceTable + " (id INTEGER, value VARCHAR)");
+            assertUpdate("INSERT INTO " + tableName + " VALUES (1, 'a'), (2, 'a'), (3, 'a')", 3);
+            assertUpdate("INSERT INTO " + sourceTable + " VALUES (2, 'merged')", 1);
+            assertQuery("SELECT id, \"_row_id\" FROM " + tableName + " ORDER BY id", "VALUES (1, 0), (2, 1), (3, 2)");
+
+            assertUpdate("MERGE INTO " + tableName + " t USING " + sourceTable + " s ON t.id = s.id " +
+                    "WHEN MATCHED THEN UPDATE SET value = s.value", 1);
+
+            // The data is right; only the identity is not. Row 2 reads 3, the next free id.
+            assertQuery("SELECT id, value FROM " + tableName + " ORDER BY id",
+                    "VALUES (1, 'a'), (2, 'merged'), (3, 'a')");
+            assertQuery("SELECT id, \"_row_id\" FROM " + tableName + " ORDER BY id", "VALUES (1, 0), (2, 3), (3, 2)");
+        }
+        finally {
+            dropTable(tableName);
+            dropTable(sourceTable);
+        }
+    }
+
+    @Test
+    public void testMergeDeleteOnV3Table()
+    {
+        String tableName = "test_v3_merge_delete";
+        String sourceTable = "test_v3_merge_delete_src";
+        try {
+            assertUpdate("CREATE TABLE " + tableName
+                    + " (id INTEGER, value VARCHAR) WITH (\"format-version\" = '3', \"write.update.mode\" = 'merge-on-read')");
+            assertUpdate("CREATE TABLE " + sourceTable + " (id INTEGER)");
+            assertUpdate("INSERT INTO " + tableName + " VALUES (1, 'a'), (2, 'b'), (3, 'c')", 3);
+            assertUpdate("INSERT INTO " + sourceTable + " VALUES 2", 1);
+
+            assertUpdate("MERGE INTO " + tableName + " t USING " + sourceTable + " s ON t.id = s.id " +
+                    "WHEN MATCHED THEN DELETE", 1);
+            assertQuery("SELECT id, value FROM " + tableName + " ORDER BY id", "VALUES (1, 'a'), (3, 'c')");
         }
         finally {
             dropTable(tableName);
