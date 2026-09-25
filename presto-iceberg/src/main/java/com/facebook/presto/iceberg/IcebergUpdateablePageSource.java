@@ -510,6 +510,13 @@ public class IcebergUpdateablePageSource
 
     private static boolean hasAnyNull(Block block)
     {
+        // A block with no positions holds no nulls. Worth stating rather than leaving to the loop
+        // below, because the run-length case reads position zero directly and an empty page has no
+        // position zero to read -- which is reachable as soon as a delete filter removes every row
+        // of a page, and then fails the query rather than returning no rows.
+        if (block.getPositionCount() == 0) {
+            return false;
+        }
         if (block instanceof RunLengthEncodedBlock) {
             return block.isNull(0);
         }
