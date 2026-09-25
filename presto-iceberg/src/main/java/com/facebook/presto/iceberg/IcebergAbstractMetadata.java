@@ -2143,6 +2143,19 @@ public abstract class IcebergAbstractMetadata
         validateBranchExists(handle, icebergTable);
         int formatVersion = opsFromTable(icebergTable).current().formatVersion();
 
+        // Deliberately still MAX_FORMAT_VERSION_FOR_ROW_LEVEL_OPERATIONS rather than the
+        // delete-side gate, even though the machinery to write a V3 update already works.
+        //
+        // Lifting this produces the right data and the wrong lineage. The replacement row goes
+        // through the ordinary insert sink, which assigns it a fresh row id, so a V3 update does
+        // not preserve the identity row lineage exists to provide: updating one of three rows
+        // written with ids 0, 1, 2 leaves it reading id 3. The sequence number does advance, so a
+        // consumer keyed on grouping columns still sees the change -- but one keyed on row
+        // identity, which is what row-preserving materialized view maintenance would be, silently
+        // stops matching the row it is tracking.
+        //
+        // Whoever lifts this has to carry the old row id into the replacement row first. Neither
+        // of the upstream deletion-vector pull requests addresses it.
         if (formatVersion > MAX_FORMAT_VERSION_FOR_ROW_LEVEL_OPERATIONS) {
             throw new PrestoException(NOT_SUPPORTED,
                     format("Iceberg table updates for format version %s are not supported yet", formatVersion));
