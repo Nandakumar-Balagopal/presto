@@ -234,12 +234,15 @@ import static com.facebook.presto.iceberg.IcebergTableType.CHANGELOG;
 import static com.facebook.presto.iceberg.IcebergTableType.DATA;
 import static com.facebook.presto.iceberg.IcebergTableType.EQUALITY_DELETES;
 import static com.facebook.presto.iceberg.IcebergUtil.MAX_FORMAT_VERSION_FOR_ROW_LEVEL_DELETE;
-import static com.facebook.presto.iceberg.IcebergUtil.MAX_FORMAT_VERSION_FOR_ROW_LEVEL_OPERATIONS;
+import static com.facebook.presto.iceberg.IcebergUtil.MAX_FORMAT_VERSION_FOR_ROW_LEVEL_MERGE;
+import static com.facebook.presto.iceberg.IcebergUtil.MAX_FORMAT_VERSION_FOR_ROW_LEVEL_UPDATE;
 import static com.facebook.presto.iceberg.IcebergUtil.MIN_FORMAT_VERSION_FOR_DELETE;
+import static com.facebook.presto.iceberg.IcebergUtil.MIN_FORMAT_VERSION_FOR_DELETION_VECTORS;
 import static com.facebook.presto.iceberg.IcebergUtil.MIN_FORMAT_VERSION_FOR_ROW_LINEAGE;
 import static com.facebook.presto.iceberg.IcebergUtil.buildColumnMetadata;
 import static com.facebook.presto.iceberg.IcebergUtil.convertToIcebergLiteral;
 import static com.facebook.presto.iceberg.IcebergUtil.createDomainFromIcebergPartitionValue;
+import static com.facebook.presto.iceberg.IcebergUtil.deletionVectorsInEffect;
 import static com.facebook.presto.iceberg.IcebergUtil.getColumns;
 import static com.facebook.presto.iceberg.IcebergUtil.getColumnsForWrite;
 import static com.facebook.presto.iceberg.IcebergUtil.getDeleteMode;
@@ -1009,9 +1012,13 @@ public abstract class IcebergAbstractMetadata
         validateBranchExists(icebergTableHandle, icebergTable);
         int formatVersion = ((BaseTable) icebergTable).operations().current().formatVersion();
 
-        if (formatVersion > MAX_FORMAT_VERSION_FOR_ROW_LEVEL_OPERATIONS) {
+        // A version 3 merge writes its deletes as deletion vectors, seeded from the vectors this
+        // handle carries so that superseding one does not undo it. What it does not do is preserve
+        // row lineage across a matched update, for a reason outside the connector -- see
+        // MAX_FORMAT_VERSION_FOR_ROW_LEVEL_MERGE.
+        if (formatVersion > MAX_FORMAT_VERSION_FOR_ROW_LEVEL_MERGE) {
             throw new PrestoException(NOT_SUPPORTED,
-                    format("Iceberg table updates for format version %s are not supported yet", formatVersion));
+                    format("Iceberg table merges for format version %s are not supported yet", formatVersion));
         }
 
         if (formatVersion < MIN_FORMAT_VERSION_FOR_DELETE ||
@@ -1038,7 +1045,13 @@ public abstract class IcebergAbstractMetadata
 
         Map<Integer, PrestoIcebergPartitionSpec> partitionSpecs = transformValues(icebergTable.specs(), partitionSpec -> toPrestoPartitionSpec(partitionSpec, typeManager));
 
-        return new IcebergMergeTableHandle(icebergTableHandle, insertHandle, partitionSpecs);
+        // Below version 3 there are no deletion vectors to supersede, so the manifest walk is skipped.
+        Map<String, com.facebook.presto.iceberg.delete.DeleteFile> vectorsInEffect =
+                formatVersion >= MIN_FORMAT_VERSION_FOR_DELETION_VECTORS
+                        ? deletionVectorsInEffect(icebergTable)
+                        : ImmutableMap.of();
+
+        return new IcebergMergeTableHandle(icebergTableHandle, insertHandle, partitionSpecs, vectorsInEffect, formatVersion);
     }
 
     @Override
@@ -2122,6 +2135,15 @@ public abstract class IcebergAbstractMetadata
         unmodifiedColumns.add(ROW_POSITION);
         // Include all the non-updated columns. These are needed when writing the new data file with updated column values.
         IcebergTableHandle table = (IcebergTableHandle) tableHandle;
+        // On a row-lineage table the replacement row also has to carry the identity of the row it
+        // replaces, so read the old _row_id alongside the values being kept. The format version is
+        // read from the table rather than from the handle's storage properties, which are optional:
+        // an absent map would silently drop this column, and the write path would then assign the
+        // replacement row a fresh identity -- the exact defect this is here to prevent.
+        Table icebergTable = getIcebergTable(session, table.getSchemaTableName());
+        if (opsFromTable(icebergTable).current().formatVersion() >= MIN_FORMAT_VERSION_FOR_ROW_LINEAGE) {
+            unmodifiedColumns.add(MetadataColumns.ROW_ID);
+        }
         Set<Integer> updatedFields = updatedColumns.stream()
                 .map(IcebergColumnHandle.class::cast)
                 .map(IcebergColumnHandle::getId)
@@ -2143,20 +2165,14 @@ public abstract class IcebergAbstractMetadata
         validateBranchExists(handle, icebergTable);
         int formatVersion = opsFromTable(icebergTable).current().formatVersion();
 
-        // Deliberately still MAX_FORMAT_VERSION_FOR_ROW_LEVEL_OPERATIONS rather than the
-        // delete-side gate, even though the machinery to write a V3 update already works.
-        //
-        // Lifting this produces the right data and the wrong lineage. The replacement row goes
-        // through the ordinary insert sink, which assigns it a fresh row id, so a V3 update does
-        // not preserve the identity row lineage exists to provide: updating one of three rows
-        // written with ids 0, 1, 2 leaves it reading id 3. The sequence number does advance, so a
-        // consumer keyed on grouping columns still sees the change -- but one keyed on row
-        // identity, which is what row-preserving materialized view maintenance would be, silently
-        // stops matching the row it is tracking.
-        //
-        // Whoever lifts this has to carry the old row id into the replacement row first. Neither
-        // of the upstream deletion-vector pull requests addresses it.
-        if (formatVersion > MAX_FORMAT_VERSION_FOR_ROW_LEVEL_OPERATIONS) {
+        // A V3 update preserves row lineage. getUpdateRowIdColumn reads the old _row_id alongside
+        // the columns being kept, IcebergUpdateablePageSource resolves it against the file's
+        // first_row_id and carries it into the replacement row, and the sink writes it as an
+        // explicit column so the commit does not assign a fresh identity. Updating one of three
+        // rows written with ids 0, 1, 2 leaves it reading its own id, with only
+        // _last_updated_sequence_number advanced -- which is what row lineage is for, and what a
+        // consumer keyed on row identity rather than on grouping columns needs.
+        if (formatVersion > MAX_FORMAT_VERSION_FOR_ROW_LEVEL_UPDATE) {
             throw new PrestoException(NOT_SUPPORTED,
                     format("Iceberg table updates for format version %s are not supported yet", formatVersion));
         }

@@ -148,6 +148,8 @@ public class IcebergPageSinkProvider
                 tableHandle.getFileFormat(),
                 partitionSpecs,
                 pageSink,
-                tableHandle.getInputColumns().size());
+                tableHandle.getInputColumns().size(),
+                merge.getFormatVersion(),
+                merge.getDeletionVectorsInEffect());
     }
 }

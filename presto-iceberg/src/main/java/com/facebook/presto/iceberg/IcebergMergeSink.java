@@ -20,7 +20,9 @@ import com.facebook.presto.common.block.ColumnarRow;
 import com.facebook.presto.common.type.VarcharType;
 import com.facebook.presto.hive.HdfsContext;
 import com.facebook.presto.hive.HdfsEnvironment;
+import com.facebook.presto.iceberg.delete.DeleteFile;
 import com.facebook.presto.iceberg.delete.IcebergDeletePageSink;
+import com.facebook.presto.iceberg.delete.IcebergDeletionVectorPageSink;
 import com.facebook.presto.spi.ConnectorMergeSink;
 import com.facebook.presto.spi.ConnectorPageSink;
 import com.facebook.presto.spi.ConnectorSession;
@@ -44,6 +46,9 @@ import java.util.concurrent.CompletableFuture;
 import static com.facebook.presto.common.block.ColumnarRow.toColumnarRow;
 import static com.facebook.presto.common.type.BigintType.BIGINT;
 import static com.facebook.presto.common.type.IntegerType.INTEGER;
+import static com.facebook.presto.iceberg.IcebergUtil.MIN_FORMAT_VERSION_FOR_DELETION_VECTORS;
+import static com.facebook.presto.iceberg.IcebergUtil.readDeletionVectorBlob;
+import static com.facebook.presto.iceberg.delete.DeletionVectors.applyDeletionVector;
 import static com.facebook.presto.plugin.base.util.Closables.closeAllSuppress;
 import static com.facebook.presto.spi.connector.MergePage.createDeleteAndInsertPages;
 import static java.lang.Math.toIntExact;
@@ -63,6 +68,8 @@ public class IcebergMergeSink
     private final Map<Integer, PartitionSpec> partitionsSpecs;
     private final ConnectorPageSink insertPageSink;
     private final int columnCount;
+    private final int formatVersion;
+    private final Map<String, DeleteFile> deletionVectorsInEffect;
     private final Map<Slice, FileDeletion> fileDeletions = new HashMap<>();
 
     public IcebergMergeSink(
@@ -74,7 +81,9 @@ public class IcebergMergeSink
             FileFormat fileFormat,
             Map<Integer, PartitionSpec> partitionsSpecs,
             ConnectorPageSink insertPageSink,
-            int columnCount)
+            int columnCount,
+            int formatVersion,
+            Map<String, DeleteFile> deletionVectorsInEffect)
     {
         this.locationProvider = requireNonNull(locationProvider, "locationProvider is null");
         this.fileWriterFactory = requireNonNull(fileWriterFactory, "fileWriterFactory is null");
@@ -85,6 +94,8 @@ public class IcebergMergeSink
         this.partitionsSpecs = requireNonNull(partitionsSpecs, "partitionsSpecs is null");
         this.insertPageSink = requireNonNull(insertPageSink, "insertPageSink is null");
         this.columnCount = columnCount;
+        this.formatVersion = formatVersion;
+        this.deletionVectorsInEffect = requireNonNull(deletionVectorsInEffect, "deletionVectorsInEffect is null");
     }
 
     /**
@@ -149,8 +160,31 @@ public class IcebergMergeSink
         insertPageSink.abort();
     }
 
+    /**
+     * From format version 3 Iceberg requires a row-level delete to be recorded as a deletion
+     * vector and rejects the commit outright otherwise ("Must use DVs for position deletes in
+     * V3"), so the choice of sink is not a preference.
+     *
+     * <p>A vector replaces the one already masking this data file rather than adding to it, so the
+     * new one is seeded with the positions the old one held. Those positions are not otherwise
+     * recoverable here: the read side applied the old vector before the merge saw the rows, so the
+     * rows it hid never reached {@code storeMergedRows} and are absent from
+     * {@code rowsToDelete}. Dropping them would resurrect rows an earlier operation deleted.
+     */
     private ConnectorPageSink createPositionDeletePageSink(String dataFilePath, PartitionSpec partitionSpec, String partitionDataJson)
     {
+        if (formatVersion >= MIN_FORMAT_VERSION_FOR_DELETION_VECTORS) {
+            return new IcebergDeletionVectorPageSink(
+                    partitionSpec,
+                    Optional.of(partitionDataJson),
+                    locationProvider,
+                    hdfsEnvironment,
+                    new HdfsContext(session),
+                    jsonCodec,
+                    session,
+                    dataFilePath,
+                    alreadyDeletedPositions(dataFilePath));
+        }
         return new IcebergDeletePageSink(
                 partitionSpec,
                 Optional.of(partitionDataJson),
@@ -162,6 +196,16 @@ public class IcebergMergeSink
                 session,
                 dataFilePath,
                 fileFormat);
+    }
+
+    private Roaring64Bitmap alreadyDeletedPositions(String dataFilePath)
+    {
+        Roaring64Bitmap positions = new Roaring64Bitmap();
+        DeleteFile existing = deletionVectorsInEffect.get(dataFilePath);
+        if (existing != null) {
+            applyDeletionVector(readDeletionVectorBlob(hdfsEnvironment, session, existing), existing, positions);
+        }
+        return positions;
     }
 
     private static Collection<Slice> writePositionDeletes(ConnectorPageSink sink, ImmutableLongBitmapDataProvider rowsToDelete)

@@ -39,6 +39,7 @@ import com.facebook.presto.hive.HivePartitionKey;
 import com.facebook.presto.hive.HiveStorageFormat;
 import com.facebook.presto.hive.HiveType;
 import com.facebook.presto.hive.PartitionSet;
+import com.facebook.presto.hive.filesystem.ExtendedFileSystem;
 import com.facebook.presto.hive.metastore.Column;
 import com.facebook.presto.hive.metastore.ExtendedHiveMetastore;
 import com.facebook.presto.hive.metastore.MetastoreContext;
@@ -59,6 +60,9 @@ import com.google.common.collect.ImmutableSet;
 import com.google.common.collect.Sets;
 import io.airlift.slice.Slice;
 import io.airlift.slice.Slices;
+import org.apache.hadoop.conf.Configuration;
+import org.apache.hadoop.fs.FSDataInputStream;
+import org.apache.hadoop.fs.Path;
 import org.apache.iceberg.BaseTable;
 import org.apache.iceberg.BaseTransaction;
 import org.apache.iceberg.ContentFile;
@@ -68,6 +72,7 @@ import org.apache.iceberg.DeleteFile;
 import org.apache.iceberg.FileScanTask;
 import org.apache.iceberg.HistoryEntry;
 import org.apache.iceberg.ManifestFile;
+import org.apache.iceberg.MetadataColumns;
 import org.apache.iceberg.MetadataTableType;
 import org.apache.iceberg.PartitionField;
 import org.apache.iceberg.PartitionSpec;
@@ -154,6 +159,7 @@ import static com.facebook.presto.iceberg.FileContent.fromIcebergFileContent;
 import static com.facebook.presto.iceberg.IcebergColumnHandle.DATA_SEQUENCE_NUMBER_COLUMN_HANDLE;
 import static com.facebook.presto.iceberg.IcebergColumnHandle.LAST_UPDATED_SEQUENCE_NUMBER_COLUMN_HANDLE;
 import static com.facebook.presto.iceberg.IcebergColumnHandle.PATH_COLUMN_HANDLE;
+import static com.facebook.presto.iceberg.IcebergErrorCode.ICEBERG_CANNOT_OPEN_SPLIT;
 import static com.facebook.presto.iceberg.IcebergErrorCode.ICEBERG_INVALID_FORMAT_VERSION;
 import static com.facebook.presto.iceberg.IcebergErrorCode.ICEBERG_INVALID_PARTITION_VALUE;
 import static com.facebook.presto.iceberg.IcebergErrorCode.ICEBERG_INVALID_SNAPSHOT_ID;
@@ -165,6 +171,8 @@ import static com.facebook.presto.iceberg.IcebergSessionProperties.isMergeOnRead
 import static com.facebook.presto.iceberg.IcebergTableProperties.getWriteDataLocation;
 import static com.facebook.presto.iceberg.IcebergTableProperties.isHiveLocksEnabled;
 import static com.facebook.presto.iceberg.TypeConverter.toIcebergType;
+import static com.facebook.presto.iceberg.delete.DeletionVectors.blobLength;
+import static com.facebook.presto.iceberg.delete.DeletionVectors.blobOffset;
 import static com.facebook.presto.iceberg.util.IcebergPrestoModelConverters.toIcebergTableIdentifier;
 import static com.facebook.presto.spi.StandardErrorCode.GENERIC_INTERNAL_ERROR;
 import static com.facebook.presto.spi.StandardErrorCode.NOT_FOUND;
@@ -246,16 +254,35 @@ public final class IcebergUtil
      * vector and refuses a commit carrying a positional delete file. Below it the reverse holds.
      */
     public static final int MIN_FORMAT_VERSION_FOR_DELETION_VECTORS = 3;
-    public static final int MAX_FORMAT_VERSION_FOR_ROW_LEVEL_OPERATIONS = 2;
     /**
-     * The highest format version whose row-level deletes the connector can write, which is ahead of
-     * what it can update or merge. A delete only has to record which rows went away, and it now
-     * does that as a deletion vector; an update or a merge additionally writes replacement rows,
-     * whose row lineage and change-set representation are not implemented for this version yet.
-     * Kept separate so DELETE is not held back by them, and so neither is quietly enabled by a
-     * change meant for the other.
+     * The highest format version whose row-level deletes the connector can write. A delete only has
+     * to record which rows went away, and from version 3 it does that as a deletion vector.
      */
     public static final int MAX_FORMAT_VERSION_FOR_ROW_LEVEL_DELETE = 3;
+    /**
+     * The highest format version whose updates the connector can write. An update additionally
+     * writes a replacement row, which on a row-lineage table has to keep the identity of the row it
+     * replaces rather than be given a fresh one -- see the gate in
+     * {@code IcebergAbstractMetadata.beginUpdate} for how that is arranged.
+     */
+    public static final int MAX_FORMAT_VERSION_FOR_ROW_LEVEL_UPDATE = 3;
+    /**
+     * The highest format version the connector can MERGE into. Its deletes are recorded as
+     * deletion vectors, so a version 3 commit accepts them, and a vector superseding another
+     * restates what that one held.
+     *
+     * <p>Row lineage is the exception, and the gate does not stop it: a matched update does not
+     * preserve {@code _row_id}, where {@code UPDATE} does. The engine expands a matched update into
+     * a delete row and an insert row, and nulls the row-id on the insert half -- so the sink cannot
+     * tell it from an unmatched insert, let alone recover the identity of the row it replaces.
+     * Closing that needs the merge rewrite to carry the target row id onto the insert half, which
+     * is engine-side and changes a contract every connector's merge sink shares.
+     * See {@code TestIcebergV3.testMergeOnV3TableDoesNotPreserveRowLineage}.
+     *
+     * <p>Kept separate from the update and delete gates so none is quietly moved by a change meant
+     * for another.
+     */
+    public static final int MAX_FORMAT_VERSION_FOR_ROW_LEVEL_MERGE = 3;
     public static final int MIN_FORMAT_VERSION_FOR_ROW_LINEAGE = 3;
     public static final int MAX_FORMAT_VERSION_FOR_METADATA_TABLES = 3;
     public static final int MAX_SUPPORTED_FORMAT_VERSION = 3;
@@ -295,6 +322,87 @@ public final class IcebergUtil
     public static Table getShallowWrappedIcebergTable(Schema schema, PartitionSpec spec, Map<String, String> properties, Optional<SortOrder> sortOrder)
     {
         return new PrestoIcebergTableForMetricsConfig(schema, spec, properties, sortOrder);
+    }
+
+    /**
+     * Reads just the one deletion-vector blob that {@code delete} points at. The manifest records
+     * the blob's byte range, so there is no need to parse the Puffin footer or to read the vectors
+     * of any other data file sharing the same Puffin file.
+     */
+    public static byte[] readDeletionVectorBlob(HdfsEnvironment hdfsEnvironment, ConnectorSession session, com.facebook.presto.iceberg.delete.DeleteFile delete)
+    {
+        Path path = new Path(delete.path());
+        Configuration configuration = hdfsEnvironment.getConfiguration(new HdfsContext(session), path);
+        byte[] blob = new byte[toIntExact(blobLength(delete))];
+        try {
+            ExtendedFileSystem fileSystem = hdfsEnvironment.getFileSystem(session.getUser(), path, configuration);
+            try (FSDataInputStream inputStream = hdfsEnvironment.doAs(session.getUser(), () -> fileSystem.open(path))) {
+                inputStream.readFully(blobOffset(delete), blob);
+            }
+        }
+        catch (IOException e) {
+            throw new PrestoException(ICEBERG_CANNOT_OPEN_SPLIT, format("Cannot open Iceberg deletion vector file: %s", delete.path()), e);
+        }
+        return blob;
+    }
+
+    /**
+     * Every deletion vector currently in effect, keyed by the data file it masks.
+     *
+     * <p>Wanted by a writer that is about to replace one. A vector supersedes its predecessor
+     * rather than adding to it -- Iceberg permits only one per data file -- so a writer that
+     * records only the rows it is removing would bring back the rows an earlier operation removed.
+     * The positions to keep are therefore read out of the vector in effect and carried into the new
+     * one. The read path does not need this, having applied the vector already.
+     *
+     * <p>This walks the table's delete manifests, the same walk {@code removeSupersededDeletionVectors}
+     * makes at commit. Worth doing only where a vector may actually be superseded, which is why the
+     * callers gate it on the format version.
+     */
+    public static Map<String, com.facebook.presto.iceberg.delete.DeleteFile> deletionVectorsInEffect(Table icebergTable)
+    {
+        ImmutableMap.Builder<String, com.facebook.presto.iceberg.delete.DeleteFile> vectors = ImmutableMap.builder();
+        try (CloseableIterable<FileScanTask> tasks = icebergTable.newScan().planFiles()) {
+            for (FileScanTask task : tasks) {
+                for (DeleteFile delete : task.deletes()) {
+                    if (delete.content() == org.apache.iceberg.FileContent.POSITION_DELETES
+                            && delete.format() == org.apache.iceberg.FileFormat.PUFFIN
+                            && delete.referencedDataFile() != null) {
+                        vectors.put(delete.referencedDataFile(), com.facebook.presto.iceberg.delete.DeleteFile.fromIceberg(delete));
+                    }
+                }
+            }
+        }
+        catch (IOException e) {
+            throw new PrestoException(ICEBERG_CANNOT_OPEN_SPLIT, "Cannot enumerate the table's deletion vectors", e);
+        }
+        // A data file has at most one vector, so a duplicate key would mean the table is in a state
+        // Iceberg forbids; buildOrThrow rather than silently keeping one of them.
+        return vectors.buildOrThrow();
+    }
+
+    /**
+     * The table's schema with Iceberg's reserved {@code _row_id} appended, for writing a data file
+     * whose rows carry a row id of their own rather than inheriting one.
+     *
+     * <p>A V3 data file normally states no row ids at all: the commit stamps it with a
+     * {@code first_row_id} and every row's identity is {@code first_row_id + position}. That is
+     * right for an insert, and wrong for the replacement row an update writes, which has to keep
+     * the identity of the row it replaces. Writing the column explicitly is how the format says to
+     * do that -- a materialized {@code _row_id} wins over the implicit one, and a null falls back
+     * to it, so the two can sit in one file.
+     *
+     * <p>{@code _last_updated_sequence_number} is deliberately left out. Its null means "the
+     * sequence number of the commit that wrote this", which is exactly what an updated row wants,
+     * so materializing it would write a column whose every value the reader already knows. The
+     * two fields are independent; neither implies the other.
+     */
+    public static Schema schemaWithMaterializedRowId(Schema schema)
+    {
+        return new Schema(ImmutableList.<NestedField>builder()
+                .addAll(schema.columns())
+                .add(MetadataColumns.ROW_ID)
+                .build());
     }
 
     public static Table getHiveIcebergTable(ExtendedHiveMetastore metastore, HdfsEnvironment hdfsEnvironment, IcebergHiveTableOperationsConfig config, ManifestFileCache manifestFileCache, ConnectorSession session, IcebergCatalogName catalogName, SchemaTableName table)

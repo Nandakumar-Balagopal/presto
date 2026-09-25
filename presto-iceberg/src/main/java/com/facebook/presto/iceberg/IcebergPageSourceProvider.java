@@ -92,6 +92,7 @@ import org.apache.hadoop.fs.FSDataInputStream;
 import org.apache.hadoop.fs.FileStatus;
 import org.apache.hadoop.fs.Path;
 import org.apache.hadoop.hdfs.BlockMissingException;
+import org.apache.iceberg.MetadataColumns;
 import org.apache.iceberg.PartitionSpec;
 import org.apache.iceberg.PartitionSpecParser;
 import org.apache.iceberg.Schema;
@@ -163,12 +164,11 @@ import static com.facebook.presto.iceberg.IcebergUtil.MIN_FORMAT_VERSION_FOR_DEL
 import static com.facebook.presto.iceberg.IcebergUtil.getColumns;
 import static com.facebook.presto.iceberg.IcebergUtil.getLocationProvider;
 import static com.facebook.presto.iceberg.IcebergUtil.getShallowWrappedIcebergTable;
+import static com.facebook.presto.iceberg.IcebergUtil.schemaWithMaterializedRowId;
 import static com.facebook.presto.iceberg.TypeConverter.ORC_ICEBERG_ID_KEY;
 import static com.facebook.presto.iceberg.TypeConverter.toHiveType;
 import static com.facebook.presto.iceberg.TypeConverter.toPrestoType;
 import static com.facebook.presto.iceberg.delete.DeletionVectors.applyDeletionVector;
-import static com.facebook.presto.iceberg.delete.DeletionVectors.blobLength;
-import static com.facebook.presto.iceberg.delete.DeletionVectors.blobOffset;
 import static com.facebook.presto.iceberg.delete.EqualityDeleteFilter.readEqualityDeletes;
 import static com.facebook.presto.iceberg.delete.PositionDeleteFilter.readPositionDeletes;
 import static com.facebook.presto.memory.context.AggregatedMemoryContext.newSimpleAggregatedMemoryContext;
@@ -197,7 +197,6 @@ import static com.google.common.collect.Maps.uniqueIndex;
 import static io.airlift.slice.Slices.EMPTY_SLICE;
 import static io.airlift.slice.Slices.utf8Slice;
 import static java.lang.Integer.parseInt;
-import static java.lang.Math.toIntExact;
 import static java.lang.String.format;
 import static java.time.ZoneOffset.UTC;
 import static java.util.Locale.ENGLISH;
@@ -870,6 +869,14 @@ public class IcebergPageSourceProvider
                             IcebergColumnHandle handle = IcebergColumnHandle.create(SPEC_ID, typeManager, REGULAR);
                             columnsToReadFromStorage.add(handle);
                         }
+                        else if (colId.getId() == MetadataColumns.ROW_ID.fieldId()) {
+                            // Reserved, so it is absent from tableSchema and would fall through to
+                            // the lookup below and be reported missing. The data file may or may
+                            // not hold it; IcebergUpdateablePageSource fills in the rows that do
+                            // not from first_row_id + position.
+                            IcebergColumnHandle handle = IcebergColumnHandle.create(MetadataColumns.ROW_ID, typeManager, REGULAR);
+                            columnsToReadFromStorage.add(handle);
+                        }
                         else if (colId.getId() == MERGE_PARTITION_DATA.getId()) {
                             NestedField mergePartitionData = NestedField.required(MERGE_PARTITION_DATA.getId(),
                                     MERGE_PARTITION_DATA.getColumnName(), Types.StringType.get());
@@ -988,8 +995,16 @@ public class IcebergPageSourceProvider
         Supplier<Optional<RowPredicate>> deletePredicate = memoize(() -> deleteFilters.get().stream()
                 .map(filter -> filter.createPredicate(delegateColumns))
                 .reduce(RowPredicate::and));
+        // Whether the replacement rows an update writes have to state their own row ids is decided
+        // by one fact -- whether the row-id struct carries _row_id -- and read here rather than
+        // recomputed, so the write schema cannot disagree with what the reader actually supplies.
+        boolean materializeRowId = rowIdColumnHandle
+                .map(rowIdColumn -> rowIdColumn.getColumnIdentity().getChildren().stream()
+                        .anyMatch(child -> child.getId() == MetadataColumns.ROW_ID.fieldId()))
+                .orElse(false);
+        Schema writeSchema = materializeRowId ? schemaWithMaterializedRowId(tableSchema) : tableSchema;
         Table icebergTable = getShallowWrappedIcebergTable(
-                tableSchema,
+                writeSchema,
                 partitionSpec,
                 table.getStorageProperties().orElseThrow(() -> new IllegalArgumentException("storage properties must not be null")),
                 Optional.empty());
@@ -1000,7 +1015,7 @@ public class IcebergPageSourceProvider
                 pageIndexerFactory,
                 hdfsEnvironment,
                 hdfsContext,
-                getColumns(tableSchema, partitionSpec, typeManager),
+                getColumns(writeSchema, partitionSpec, typeManager),
                 ImmutableList.of(),
                 jsonCodec,
                 session,
@@ -1225,21 +1240,7 @@ public class IcebergPageSourceProvider
      */
     private byte[] readDeletionVectorBlob(ConnectorSession session, DeleteFile delete)
     {
-        Path path = new Path(delete.path());
-        HdfsContext hdfsContext = new HdfsContext(session);
-        Configuration configuration = hdfsEnvironment.getConfiguration(hdfsContext, path);
-        long offset = blobOffset(delete);
-        byte[] blob = new byte[toIntExact(blobLength(delete))];
-        try {
-            ExtendedFileSystem fileSystem = hdfsEnvironment.getFileSystem(session.getUser(), path, configuration);
-            try (FSDataInputStream inputStream = hdfsEnvironment.doAs(session.getUser(), () -> fileSystem.open(path))) {
-                inputStream.readFully(offset, blob);
-            }
-        }
-        catch (IOException e) {
-            throw new PrestoException(ICEBERG_CANNOT_OPEN_SPLIT, format("Cannot open Iceberg deletion vector file: %s", delete.path()), e);
-        }
-        return blob;
+        return IcebergUtil.readDeletionVectorBlob(hdfsEnvironment, session, delete);
     }
 
     private ConnectorPageSource openDeletes(
