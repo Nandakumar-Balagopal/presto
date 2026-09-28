@@ -61,6 +61,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.OptionalInt;
 import java.util.OptionalLong;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import static com.facebook.presto.common.type.IntegerType.INTEGER;
 import static com.facebook.presto.common.type.VarcharType.VARCHAR;
@@ -1137,10 +1138,16 @@ public class TestIcebergV3
      * Produces a deletion-vector blob with Iceberg's writer, then reads back exactly the bytes the
      * manifest says the blob occupies -- the same range Presto's reader uses.
      */
+    /**
+     * Counter rather than a fixed name: two tests call this helper, and surefire may run them at
+     * the same time, so a shared name collides on whichever creates the table second.
+     */
+    private final AtomicInteger blobSourceTableCounter = new AtomicInteger();
+
     private byte[] serializeDeletionVector(List<Long> positions)
             throws Exception
     {
-        String tableName = "test_dv_blob_source";
+        String tableName = "test_dv_blob_source_" + blobSourceTableCounter.incrementAndGet();
         try {
             assertUpdate("CREATE TABLE " + tableName + " (id integer) WITH (\"format-version\" = '3')");
             assertUpdate("INSERT INTO " + tableName + " VALUES 1", 1);
