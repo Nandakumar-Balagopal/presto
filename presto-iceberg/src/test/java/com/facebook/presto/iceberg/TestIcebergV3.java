@@ -930,6 +930,54 @@ public class TestIcebergV3
         }
     }
 
+    /**
+     * Pins a defect, not a desired behaviour: compaction discards row lineage.
+     *
+     * <p>A {@code replace} operation rewrites files without changing rows, so every row should keep
+     * its {@code _row_id} and its {@code _last_updated_sequence_number}. Neither survives. The
+     * rewrite reads rows and writes them through the ordinary insert sink, which materializes no
+     * {@code _row_id}, so the rewritten file states no ids and its rows take implicit ones from its
+     * own {@code first_row_id} -- new identities, and not even in the old order, since the merged
+     * file's row order need not match.
+     *
+     * <p>Two consequences. A consumer keyed on row identity loses every row it was tracking. And
+     * because every row's sequence number advances to the compaction's, the changed-rows predicate
+     * then matches the whole table, so the next incremental refresh recomputes everything --
+     * compaction silently costs incrementality, not just lineage.
+     *
+     * <p>Fixing it is the same carry the update path already performs
+     * ({@link com.facebook.presto.iceberg.IcebergUtil#schemaWithMaterializedRowId}), applied to the
+     * rewrite. Until then {@code isAppendOnlyRange} must keep refusing {@code REPLACE}: the refusal
+     * looks over-conservative, but with lineage destroyed the predicate genuinely does match every
+     * row, and declining to a full refresh is the correct answer.
+     *
+     * <p>When this is fixed the assertions below fail. Replace them with the preserved values.
+     */
+    @Test
+    public void testCompactionDiscardsRowLineage()
+    {
+        String tableName = "test_v3_compact_lineage";
+        try {
+            assertUpdate("CREATE TABLE " + tableName + " (id INTEGER, v DOUBLE) WITH (\"format-version\" = '3')");
+            assertUpdate("INSERT INTO " + tableName + " VALUES (1, 100.0)", 1);
+            assertUpdate("INSERT INTO " + tableName + " VALUES (2, 200.0)", 1);
+            assertUpdate("INSERT INTO " + tableName + " VALUES (3, 300.0)", 1);
+            assertQuery("SELECT id, \"_row_id\", \"_last_updated_sequence_number\" FROM " + tableName + " ORDER BY id",
+                    "VALUES (1, 0, 1), (2, 1, 2), (3, 2, 3)");
+
+            assertQuerySucceeds(format("CALL system.rewrite_data_files(schema => '%s', table_name => '%s', options => map(array['rewrite-all'], array['true']))", TEST_SCHEMA, tableName));
+
+            // The data is intact, so testOptimizeOnV3Table passes and this defect stays invisible there.
+            assertQuery("SELECT id, v FROM " + tableName + " ORDER BY id", "VALUES (1, 100.0), (2, 200.0), (3, 300.0)");
+            // Every identity is new, and every row now claims to have changed at the compaction.
+            assertQuery("SELECT count(DISTINCT \"_last_updated_sequence_number\") FROM " + tableName, "VALUES 1");
+            assertQuery("SELECT count(*) FROM " + tableName + " WHERE \"_row_id\" IN (0, 1, 2)", "VALUES 0");
+        }
+        finally {
+            dropTable(tableName);
+        }
+    }
+
     @Test
     public void testOptimizeOnV3Table()
     {
