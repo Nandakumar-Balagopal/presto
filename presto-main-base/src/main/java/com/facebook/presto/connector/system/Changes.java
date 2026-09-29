@@ -142,7 +142,7 @@ public class Changes
         // 64-bit value with no ordering relationship to its ancestors. Only the connector can decide
         // whether the range is valid, which it does by checking that `to` descends from `from`.
 
-        Session engineSession = SystemConnectorSessionUtil.toSession(transaction, session);
+        Session engineSession = toAnalysisSession(transaction, session);
         TableHandle tableHandle;
         try {
             tableHandle = metadata.getMetadataResolver(engineSession)
@@ -494,6 +494,36 @@ public class Changes
                 throw new PrestoException(GENERIC_INTERNAL_ERROR, "Unable to close system.changes page source", e);
             }
         }
+    }
+
+    /**
+     * The session analysis reaches the target connector through.
+     *
+     * <p>Deliberately not {@link SystemConnectorSessionUtil#toSession}, which builds its session
+     * with a testing property manager -- it documents itself as not preserving connector
+     * properties, which is fine for a system table that reads none. Analysis here resolves a table
+     * in another catalog and reads its columns, so the connector's own code runs, and the first
+     * catalog property it reads throws {@code Unknown connector <catalog>} against a manager with
+     * nothing registered. The Iceberg retry loop then reports that as {@code Table metadata is
+     * missing}, which names neither the property nor the catalog.
+     *
+     * <p>It survives the test harness because nothing there reads a catalog property on this path;
+     * a real server configures {@code HiveCachingHdfsConfiguration}, which reads
+     * {@code cache_enabled} while opening the file system.
+     */
+    private Session toAnalysisSession(ConnectorTransactionHandle transaction, ConnectorSession session)
+    {
+        Session withTestingProperties = SystemConnectorSessionUtil.toSession(transaction, session);
+        return Session.builder(sessionPropertyManager)
+                .setQueryId(withTestingProperties.getQueryId())
+                .setTransactionId(withTestingProperties.getRequiredTransactionId())
+                .setCatalog(withTestingProperties.getCatalog().orElse("system"))
+                .setSchema(withTestingProperties.getSchema().orElse("runtime"))
+                .setIdentity(withTestingProperties.getIdentity())
+                .setTimeZoneKey(withTestingProperties.getTimeZoneKey())
+                .setLocale(withTestingProperties.getLocale())
+                .setStartTime(withTestingProperties.getStartTime())
+                .build();
     }
 
     /**

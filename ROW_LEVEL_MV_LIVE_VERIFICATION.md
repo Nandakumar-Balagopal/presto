@@ -271,7 +271,7 @@ removed by a deletion vector.
 
 ## 8. What the live run found that the test suite did not
 
-### 8.1 `system.builtin.changes` fails on a real server
+### 8.1 `system.builtin.changes` failed on a real server — since fixed
 
 ```sql
 SELECT id, region, amount, change_kind
@@ -300,9 +300,13 @@ the retry loop turns that into a misleading `Table metadata is missing`. The sam
 function passes under `DistributedQueryRunner` in `TestIcebergV3`, which is why no test
 caught it.
 
-The `$changelog` table (§5) returns the same information and works, so this is a defect
-in the table-function surface only. Not fixed here — it is outside the change under test
-and wants its own commit.
+The `$changelog` table (§5) returns the same information and works, so this was a defect
+in the table-function surface only.
+
+**Fixed after this run.** `Changes.analyze` now builds its session with the injected
+`SessionPropertyManager` rather than the testing one. Re-run live over the same table, the
+function and `$changelog` agree row for row, and the narrow append→delete range correctly
+returns only the deletion-vector removal.
 
 ### 8.2 Incremental refresh requires a partitioned base
 
@@ -426,7 +430,7 @@ that. This is the delta algebra running on a real server.
 | Incremental MV refresh, only affected groups written | works, partitioned base required (§6, §8.2) |
 | Stale view returns correct results | works (§7) |
 | Row-level stale-read stitching (delta algebra) | works, plan-verified (§9) |
-| `system.builtin.changes` table function | **fails on a real server** (§8.1) |
+| `system.builtin.changes` table function | fixed after this run; see §8.1 |
 
 The one genuine defect the live run found is §8.1. §8.2 and §8.3 are configuration
 requirements, not faults — but §8.3 fails silently, which is worth a doc note upstream.

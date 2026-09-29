@@ -1,7 +1,7 @@
 # Row-level incremental MV refresh — architecture
 
-Branch `mv-row-level-incremental-refresh`. Diagrams reflect the code as committed, including
-three known defects, marked **[BUG-n]** and listed at the end.
+Branch `mv-row-level-incremental-refresh`. Diagrams reflect the code as committed. Defects are
+marked **[BUG-n]** and listed at the end; BUG-2 is fixed and kept there for the record.
 
 ---
 
@@ -10,7 +10,7 @@ three known defects, marked **[BUG-n]** and listed at the end.
 ```
 ┌─ SQL surface ─────────────────────────────────────────────────────────────────────────┐
 │  SELECT … FROM mv                    REFRESH MATERIALIZED VIEW mv                     │
-│  DELETE / UPDATE / MERGE (V3 base)   TABLE(system.builtin.changes(…))   [BUG-2]       │
+│  DELETE / UPDATE / MERGE (V3 base)   TABLE(system.builtin.changes(…))                 │
 │  SELECT … FROM "t@FROM$changelog@TO"                                                  │
 └───────────────────────────────────────────────────────────────────────────────────────┘
                 │                          │                          │
@@ -270,7 +270,7 @@ UPDATE:
 
 ---
 
-## 6. Known defects on this picture
+## 6. Defects on this picture
 
 **[BUG-1] Compaction discards row lineage.** `rewrite_data_files` writes through the ordinary
 insert sink, which materialises no `_row_id`, so rewritten rows take fresh implicit ids and every
@@ -281,12 +281,13 @@ recomputes everything. **This is why `isAppendOnlyRange` must keep refusing `REP
 though `collectChangedPartitions` accepts it — the refusal looks over-conservative but is currently
 protecting correctness.
 
-**[BUG-2] `system.builtin.changes` fails on a real server.** `Changes.analyze` builds its engine
-session with `SystemConnectorSessionUtil.toSession`, which uses
-`createTestingSessionPropertyManager` — no connectors registered. The first catalog property the
-Iceberg/Hive path reads throws `Unknown connector iceberg`, which the Iceberg retry loop turns into
-a misleading `Table metadata is missing`. The split-processor path already uses the real manager
-(`Changes.toSession`); the analyze path was never given it. `$changelog` is unaffected.
+**[BUG-2] `system.builtin.changes` failed on a real server — fixed.** `Changes.analyze` built
+its engine session with `SystemConnectorSessionUtil.toSession`, which uses
+`createTestingSessionPropertyManager` — no connectors registered. Analysis resolves a table in
+another catalog, so the connector's own code runs, and the first catalog property it read threw
+`Unknown connector iceberg`, which the Iceberg retry loop reported as `Table metadata is missing`.
+Now built with the injected manager via `Changes.toAnalysisSession`. Verified live; no in-harness
+test can guard it, since the harness never reads a catalog property on this path.
 
 **[BUG-3] `MERGE` does not preserve lineage on a matched update.** The engine expands a matched
 update into a delete row and an insert row and nulls the row-id on the insert half, so the sink
