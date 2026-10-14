@@ -64,9 +64,7 @@ public class OracleClientModule
 
         return new DriverConnectionFactory(
                 new OracleDriver(),
-                config.getConnectionUrl(),
-                Optional.ofNullable(config.getUserCredentialName()),
-                Optional.ofNullable(config.getPasswordCredentialName()),
+                config,
                 connectionProperties);
     }
 }

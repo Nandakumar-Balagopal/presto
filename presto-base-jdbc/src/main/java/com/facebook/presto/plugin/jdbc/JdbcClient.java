@@ -104,4 +104,6 @@ public interface JdbcClient
     TableStatistics getTableStatistics(ConnectorSession session, JdbcTableHandle handle, List<JdbcColumnHandle> columnHandles, TupleDomain<ColumnHandle> tupleDomain);
 
     String normalizeIdentifier(ConnectorSession session, String identifier);
+
+    default void cleanupQuery(ConnectorSession session) {}
 }

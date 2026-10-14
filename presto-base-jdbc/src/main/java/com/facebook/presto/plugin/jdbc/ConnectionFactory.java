@@ -13,6 +13,8 @@
  */
 package com.facebook.presto.plugin.jdbc;
 
+import com.facebook.presto.spi.ConnectorSession;
+
 import java.sql.Connection;
 import java.sql.SQLException;
 
@@ -22,6 +24,23 @@ public interface ConnectionFactory
 {
     Connection openConnection(JdbcIdentity identity)
             throws SQLException;
+
+    /**
+     * Opens a connection for a metadata call of the query in the session. The connection may be one
+     * that another metadata call of the same query used or is still using on this thread, so callers
+     * must close it before returning. A split or a page sink, which keeps its connection across calls,
+     * uses {@link #openConnection(JdbcIdentity)} instead.
+     */
+    default Connection openConnection(ConnectorSession session, JdbcIdentity identity)
+            throws SQLException
+    {
+        return openConnection(identity);
+    }
+
+    /**
+     * Called when the query in the session has ended, to release anything kept for it.
+     */
+    default void cleanupQuery(ConnectorSession session) {}
 
     @Override
     default void close()

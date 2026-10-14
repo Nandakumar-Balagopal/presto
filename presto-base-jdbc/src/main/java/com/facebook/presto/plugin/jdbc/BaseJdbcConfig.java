@@ -32,6 +32,7 @@ import java.util.Set;
 
 import static java.util.Locale.ENGLISH;
 import static java.util.concurrent.TimeUnit.MINUTES;
+import static java.util.concurrent.TimeUnit.SECONDS;
 
 /**
  * Base configuration class for JDBC connectors.
@@ -57,6 +58,9 @@ public class BaseJdbcConfig
     private boolean caseSensitiveNameMatchingEnabled;
     @Min(1)
     private int fetchSize = 20000;
+    private boolean connectionReuseEnabled;
+    private Duration connectionReuseRetention = new Duration(2, SECONDS);
+    private int connectionReuseMaxRetained = 10;
 
     @NotNull
     public String getConnectionUrl()
@@ -205,6 +209,47 @@ public class BaseJdbcConfig
     public BaseJdbcConfig setFetchSize(int fetchSize)
     {
         this.fetchSize = fetchSize;
+        return this;
+    }
+
+    public boolean isConnectionReuseEnabled()
+    {
+        return connectionReuseEnabled;
+    }
+
+    @Config("connection-reuse.enabled")
+    @ConfigDescription("Reuse a connection for the metadata calls of one query instead of opening one per call")
+    public BaseJdbcConfig setConnectionReuseEnabled(boolean connectionReuseEnabled)
+    {
+        this.connectionReuseEnabled = connectionReuseEnabled;
+        return this;
+    }
+
+    @MinDuration("0s")
+    public Duration getConnectionReuseRetention()
+    {
+        return connectionReuseRetention;
+    }
+
+    @Config("connection-reuse.retention")
+    @ConfigDescription("How long a connection is kept after a metadata call closes it, so that the next metadata call of the same query can reuse it. It is closed sooner when the query ends. 0 closes it immediately")
+    public BaseJdbcConfig setConnectionReuseRetention(Duration connectionReuseRetention)
+    {
+        this.connectionReuseRetention = connectionReuseRetention;
+        return this;
+    }
+
+    @Min(0)
+    public int getConnectionReuseMaxRetained()
+    {
+        return connectionReuseMaxRetained;
+    }
+
+    @Config("connection-reuse.max-retained")
+    @ConfigDescription("Maximum number of connections kept open after their callers close them, across all queries. The oldest is closed when another is kept")
+    public BaseJdbcConfig setConnectionReuseMaxRetained(int connectionReuseMaxRetained)
+    {
+        this.connectionReuseMaxRetained = connectionReuseMaxRetained;
         return this;
     }
 }

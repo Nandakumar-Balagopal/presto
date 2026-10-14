@@ -154,9 +154,15 @@ public class BaseJdbcClient
     }
 
     @Override
+    public void cleanupQuery(ConnectorSession session)
+    {
+        connectionFactory.cleanupQuery(session);
+    }
+
+    @Override
     public final Set<String> getSchemaNames(ConnectorSession session, JdbcIdentity identity)
     {
-        try (Connection connection = connectionFactory.openConnection(identity)) {
+        try (Connection connection = connectionFactory.openConnection(session, identity)) {
             return listSchemas(connection).stream()
                     .map(schemaName -> normalizeIdentifier(session, schemaName))
                     .collect(toImmutableSet());
@@ -187,7 +193,7 @@ public class BaseJdbcClient
     @Override
     public List<SchemaTableName> getTableNames(ConnectorSession session, JdbcIdentity identity, Optional<String> schema)
     {
-        try (Connection connection = connectionFactory.openConnection(identity)) {
+        try (Connection connection = connectionFactory.openConnection(session, identity)) {
             Optional<String> remoteSchema = schema.map(schemaName -> toRemoteSchemaName(session, identity, connection, schemaName));
             try (ResultSet resultSet = getTables(connection, remoteSchema, Optional.empty())) {
                 ImmutableList.Builder<SchemaTableName> list = ImmutableList.builder();
@@ -209,7 +215,7 @@ public class BaseJdbcClient
     @Override
     public JdbcTableHandle getTableHandle(ConnectorSession session, JdbcIdentity identity, SchemaTableName schemaTableName)
     {
-        try (Connection connection = connectionFactory.openConnection(identity)) {
+        try (Connection connection = connectionFactory.openConnection(session, identity)) {
             String remoteSchema = toRemoteSchemaName(session, identity, connection, schemaTableName.getSchemaName());
             String remoteTable = toRemoteTableName(session, identity, connection, remoteSchema, schemaTableName.getTableName());
             try (ResultSet resultSet = getTables(connection, Optional.of(remoteSchema), Optional.of(remoteTable))) {
@@ -239,7 +245,7 @@ public class BaseJdbcClient
     @Override
     public List<JdbcColumnHandle> getColumns(ConnectorSession session, JdbcTableHandle tableHandle)
     {
-        try (Connection connection = connectionFactory.openConnection(JdbcIdentity.from(session))) {
+        try (Connection connection = connectionFactory.openConnection(session, JdbcIdentity.from(session))) {
             try (ResultSet resultSet = getColumns(tableHandle, connection.getMetaData())) {
                 int allColumns = 0;
                 List<JdbcColumnHandle> columns = new ArrayList<>();
@@ -372,7 +378,7 @@ public class BaseJdbcClient
             throw new PrestoException(NOT_FOUND, "Schema not found: " + schemaTableName.getSchemaName());
         }
 
-        try (Connection connection = connectionFactory.openConnection(identity)) {
+        try (Connection connection = connectionFactory.openConnection(session, identity)) {
             boolean uppercase = connection.getMetaData().storesUpperCaseIdentifiers();
             String remoteSchema = toRemoteSchemaName(session, identity, connection, schemaTableName.getSchemaName());
             String remoteTable = toRemoteTableName(session, identity, connection, remoteSchema, schemaTableName.getTableName());
@@ -496,7 +502,7 @@ public class BaseJdbcClient
     @Override
     public void addColumn(ConnectorSession session, JdbcIdentity identity, JdbcTableHandle handle, ColumnMetadata column)
     {
-        try (Connection connection = connectionFactory.openConnection(identity)) {
+        try (Connection connection = connectionFactory.openConnection(session, identity)) {
             String schema = handle.getSchemaName();
             String table = handle.getTableName();
             String columnName = column.getName();
@@ -520,7 +526,7 @@ public class BaseJdbcClient
     @Override
     public void renameColumn(ConnectorSession session, JdbcIdentity identity, JdbcTableHandle handle, JdbcColumnHandle jdbcColumn, String newColumnName)
     {
-        try (Connection connection = connectionFactory.openConnection(identity)) {
+        try (Connection connection = connectionFactory.openConnection(session, identity)) {
             DatabaseMetaData metadata = connection.getMetaData();
             String schema = handle.getSchemaName();
             String table = handle.getTableName();
@@ -546,7 +552,7 @@ public class BaseJdbcClient
     @Override
     public void dropColumn(ConnectorSession session, JdbcIdentity identity, JdbcTableHandle handle, JdbcColumnHandle column)
     {
-        try (Connection connection = connectionFactory.openConnection(identity)) {
+        try (Connection connection = connectionFactory.openConnection(session, identity)) {
             DatabaseMetaData metadata = connection.getMetaData();
             String schema = handle.getSchemaName();
             String table = handle.getTableName();
@@ -574,7 +580,7 @@ public class BaseJdbcClient
                 .append("DROP TABLE ")
                 .append(quoted(handle.getCatalogName(), handle.getSchemaName(), handle.getTableName()));
 
-        try (Connection connection = connectionFactory.openConnection(identity)) {
+        try (Connection connection = connectionFactory.openConnection(session, identity)) {
             execute(connection, sql.toString());
         }
         catch (SQLException e) {
@@ -589,7 +595,7 @@ public class BaseJdbcClient
                 .append("TRUNCATE TABLE ")
                 .append(quoted(jdbcTableHandle.getCatalogName(), jdbcTableHandle.getSchemaName(), jdbcTableHandle.getTableName()));
 
-        try (Connection connection = connectionFactory.openConnection(identity)) {
+        try (Connection connection = connectionFactory.openConnection(session, identity)) {
             execute(connection, sql.toString());
         }
         catch (SQLException e) {

@@ -290,4 +290,10 @@ public class JdbcMetadata
     {
         return Optional.of(new JdbcInputInfo(url));
     }
+
+    @Override
+    public void cleanupQuery(ConnectorSession session)
+    {
+        jdbcClient.cleanupQuery(session);
+    }
 }

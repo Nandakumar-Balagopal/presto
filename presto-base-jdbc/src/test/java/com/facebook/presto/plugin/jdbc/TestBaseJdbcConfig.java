@@ -41,7 +41,10 @@ public class TestBaseJdbcConfig
                 .setCaseInsensitiveNameMatchingCacheTtl(new Duration(1, MINUTES))
                 .setlistSchemasIgnoredSchemas("information_schema")
                 .setCaseSensitiveNameMatching(false)
-                .setFetchSize(20000));
+                .setFetchSize(20000)
+                .setConnectionReuseEnabled(false)
+                .setConnectionReuseRetention(new Duration(2, SECONDS))
+                .setConnectionReuseMaxRetained(10));
     }
 
     @Test
@@ -58,6 +61,9 @@ public class TestBaseJdbcConfig
                 .put("list-schemas-ignored-schemas", "test,test2")
                 .put("case-sensitive-name-matching", "true")
                 .put("jdbc-fetch-size", "5000")
+                .put("connection-reuse.enabled", "true")
+                .put("connection-reuse.retention", "5s")
+                .put("connection-reuse.max-retained", "4")
                 .build();
 
         BaseJdbcConfig expected = new BaseJdbcConfig()
@@ -70,7 +76,10 @@ public class TestBaseJdbcConfig
                 .setlistSchemasIgnoredSchemas("test,test2")
                 .setCaseInsensitiveNameMatchingCacheTtl(new Duration(1, SECONDS))
                 .setCaseSensitiveNameMatching(true)
-                .setFetchSize(5000);
+                .setFetchSize(5000)
+                .setConnectionReuseEnabled(true)
+                .setConnectionReuseRetention(new Duration(5, SECONDS))
+                .setConnectionReuseMaxRetained(4);
 
         ConfigAssertions.assertFullMapping(properties, expected);
     }

@@ -104,9 +104,7 @@ public class MySqlClient
 
         return new DriverConnectionFactory(
                 new Driver(),
-                config.getConnectionUrl(),
-                Optional.ofNullable(config.getUserCredentialName()),
-                Optional.ofNullable(config.getPasswordCredentialName()),
+                config,
                 connectionProperties);
     }
 
