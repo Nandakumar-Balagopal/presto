@@ -31,6 +31,7 @@ import jakarta.validation.constraints.NotNull;
 import java.util.Set;
 
 import static java.util.Locale.ENGLISH;
+import static java.util.concurrent.TimeUnit.MILLISECONDS;
 import static java.util.concurrent.TimeUnit.MINUTES;
 import static java.util.concurrent.TimeUnit.SECONDS;
 
@@ -61,6 +62,15 @@ public class BaseJdbcConfig
     private boolean connectionReuseEnabled;
     private Duration connectionReuseRetention = new Duration(2, SECONDS);
     private int connectionReuseMaxRetained = 10;
+    private boolean connectionPoolEnabled;
+    private int connectionPoolMaxSize = 10;
+    private Duration connectionPoolMaxWait = new Duration(30, SECONDS);
+    private Duration connectionPoolMaxIdleTime = new Duration(5, MINUTES);
+    private int connectionPoolMaxCredentialSets = 100;
+    private Duration connectionPoolValidationBypassWindow = new Duration(500, MILLISECONDS);
+    private int connectionPoolMaxOverflow = 10;
+    private Duration connectionPoolMaxLifetime = new Duration(30, MINUTES);
+    private String connectionPoolResetSql;
 
     @NotNull
     public String getConnectionUrl()
@@ -212,6 +222,117 @@ public class BaseJdbcConfig
         return this;
     }
 
+    public boolean isConnectionPoolEnabled()
+    {
+        return connectionPoolEnabled;
+    }
+
+    @Config("connection-pool.enabled")
+    @ConfigDescription("Reuse connections to the database through a pool instead of opening one per operation")
+    public BaseJdbcConfig setConnectionPoolEnabled(boolean connectionPoolEnabled)
+    {
+        this.connectionPoolEnabled = connectionPoolEnabled;
+        return this;
+    }
+
+    @Min(1)
+    public int getConnectionPoolMaxSize()
+    {
+        return connectionPoolMaxSize;
+    }
+
+    @Config("connection-pool.max-size")
+    @ConfigDescription("Maximum number of connections the pool holds for a single set of credentials")
+    public BaseJdbcConfig setConnectionPoolMaxSize(int connectionPoolMaxSize)
+    {
+        this.connectionPoolMaxSize = connectionPoolMaxSize;
+        return this;
+    }
+
+    @MinDuration("0s")
+    public Duration getConnectionPoolMaxWait()
+    {
+        return connectionPoolMaxWait;
+    }
+
+    @Config("connection-pool.max-wait")
+    @ConfigDescription("How long to wait for a connection from an exhausted pool before failing")
+    public BaseJdbcConfig setConnectionPoolMaxWait(Duration connectionPoolMaxWait)
+    {
+        this.connectionPoolMaxWait = connectionPoolMaxWait;
+        return this;
+    }
+
+    @MinDuration("1s")
+    public Duration getConnectionPoolMaxIdleTime()
+    {
+        return connectionPoolMaxIdleTime;
+    }
+
+    @Config("connection-pool.max-idle-time")
+    @ConfigDescription("How long an unused connection is kept in the pool before it is evicted, and a pool whose credentials go unused before it is closed")
+    public BaseJdbcConfig setConnectionPoolMaxIdleTime(Duration connectionPoolMaxIdleTime)
+    {
+        this.connectionPoolMaxIdleTime = connectionPoolMaxIdleTime;
+        return this;
+    }
+
+    @Min(1)
+    public int getConnectionPoolMaxCredentialSets()
+    {
+        return connectionPoolMaxCredentialSets;
+    }
+
+    @Config("connection-pool.max-credential-sets")
+    @ConfigDescription("Maximum number of credential sets a pool is kept for, which bounds the pools created by credential pass-through")
+    public BaseJdbcConfig setConnectionPoolMaxCredentialSets(int connectionPoolMaxCredentialSets)
+    {
+        this.connectionPoolMaxCredentialSets = connectionPoolMaxCredentialSets;
+        return this;
+    }
+
+    @MinDuration("0ms")
+    public Duration getConnectionPoolValidationBypassWindow()
+    {
+        return connectionPoolValidationBypassWindow;
+    }
+
+    @Config("connection-pool.validation-bypass-window")
+    @ConfigDescription("Hand out a pooled connection without checking it if it was last used within this window, which skips the check for most borrows under load; 0ms checks every borrow")
+    public BaseJdbcConfig setConnectionPoolValidationBypassWindow(Duration connectionPoolValidationBypassWindow)
+    {
+        this.connectionPoolValidationBypassWindow = connectionPoolValidationBypassWindow;
+        return this;
+    }
+
+    @Nullable
+    public String getConnectionPoolResetSql()
+    {
+        return connectionPoolResetSql;
+    }
+
+    @Config("connection-pool.reset-sql")
+    @ConfigDescription("Statement run before a pooled connection is handed out, to clear session state left by its previous user")
+    public BaseJdbcConfig setConnectionPoolResetSql(String connectionPoolResetSql)
+    {
+        this.connectionPoolResetSql = connectionPoolResetSql;
+        return this;
+    }
+
+    @MinDuration("0s")
+    public Duration getConnectionPoolMaxLifetime()
+    {
+        return connectionPoolMaxLifetime;
+    }
+
+    @Config("connection-pool.max-lifetime")
+    @ConfigDescription("How long a pooled connection may live before it is replaced, which bounds how long an authenticated session outlives a credential change at the database. 0 keeps connections indefinitely")
+    public BaseJdbcConfig setConnectionPoolMaxLifetime(Duration connectionPoolMaxLifetime)
+    {
+        this.connectionPoolMaxLifetime = connectionPoolMaxLifetime;
+        return this;
+    }
+
     public boolean isConnectionReuseEnabled()
     {
         return connectionReuseEnabled;
@@ -250,6 +371,20 @@ public class BaseJdbcConfig
     public BaseJdbcConfig setConnectionReuseMaxRetained(int connectionReuseMaxRetained)
     {
         this.connectionReuseMaxRetained = connectionReuseMaxRetained;
+        return this;
+    }
+
+    @Min(0)
+    public int getConnectionPoolMaxOverflow()
+    {
+        return connectionPoolMaxOverflow;
+    }
+
+    @Config("connection-pool.max-overflow")
+    @ConfigDescription("Connections a node may open beyond the pool when it is exhausted, so that splits do not wait. A node opens at most max-size + max-overflow connections")
+    public BaseJdbcConfig setConnectionPoolMaxOverflow(int connectionPoolMaxOverflow)
+    {
+        this.connectionPoolMaxOverflow = connectionPoolMaxOverflow;
         return this;
     }
 }

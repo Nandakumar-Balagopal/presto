@@ -21,6 +21,7 @@ import org.testng.annotations.Test;
 
 import java.util.Map;
 
+import static java.util.concurrent.TimeUnit.MILLISECONDS;
 import static java.util.concurrent.TimeUnit.MINUTES;
 import static java.util.concurrent.TimeUnit.SECONDS;
 import static org.testng.Assert.assertEquals;
@@ -44,7 +45,16 @@ public class TestBaseJdbcConfig
                 .setFetchSize(20000)
                 .setConnectionReuseEnabled(false)
                 .setConnectionReuseRetention(new Duration(2, SECONDS))
-                .setConnectionReuseMaxRetained(10));
+                .setConnectionReuseMaxRetained(10)
+                .setConnectionPoolEnabled(false)
+                .setConnectionPoolMaxSize(10)
+                .setConnectionPoolMaxWait(new Duration(30, SECONDS))
+                .setConnectionPoolMaxIdleTime(new Duration(5, MINUTES))
+                .setConnectionPoolMaxLifetime(new Duration(30, MINUTES))
+                .setConnectionPoolMaxCredentialSets(100)
+                .setConnectionPoolValidationBypassWindow(new Duration(500, MILLISECONDS))
+                .setConnectionPoolMaxOverflow(10)
+                .setConnectionPoolResetSql(null));
     }
 
     @Test
@@ -64,6 +74,15 @@ public class TestBaseJdbcConfig
                 .put("connection-reuse.enabled", "true")
                 .put("connection-reuse.retention", "5s")
                 .put("connection-reuse.max-retained", "4")
+                .put("connection-pool.enabled", "true")
+                .put("connection-pool.max-size", "8")
+                .put("connection-pool.max-wait", "5s")
+                .put("connection-pool.max-idle-time", "1m")
+                .put("connection-pool.max-lifetime", "10m")
+                .put("connection-pool.max-credential-sets", "20")
+                .put("connection-pool.validation-bypass-window", "0ms")
+                .put("connection-pool.max-overflow", "4")
+                .put("connection-pool.reset-sql", "DISCARD ALL")
                 .build();
 
         BaseJdbcConfig expected = new BaseJdbcConfig()
@@ -79,7 +98,16 @@ public class TestBaseJdbcConfig
                 .setFetchSize(5000)
                 .setConnectionReuseEnabled(true)
                 .setConnectionReuseRetention(new Duration(5, SECONDS))
-                .setConnectionReuseMaxRetained(4);
+                .setConnectionReuseMaxRetained(4)
+                .setConnectionPoolEnabled(true)
+                .setConnectionPoolMaxSize(8)
+                .setConnectionPoolMaxWait(new Duration(5, SECONDS))
+                .setConnectionPoolMaxIdleTime(new Duration(1, MINUTES))
+                .setConnectionPoolMaxLifetime(new Duration(10, MINUTES))
+                .setConnectionPoolMaxCredentialSets(20)
+                .setConnectionPoolValidationBypassWindow(new Duration(0, MILLISECONDS))
+                .setConnectionPoolMaxOverflow(4)
+                .setConnectionPoolResetSql("DISCARD ALL");
 
         ConfigAssertions.assertFullMapping(properties, expected);
     }

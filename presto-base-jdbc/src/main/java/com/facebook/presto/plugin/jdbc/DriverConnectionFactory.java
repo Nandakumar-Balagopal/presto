@@ -14,6 +14,9 @@
 package com.facebook.presto.plugin.jdbc;
 
 import com.facebook.presto.spi.ConnectorSession;
+import com.google.common.collect.ImmutableList;
+import com.google.inject.ConfigurationException;
+import com.google.inject.spi.Message;
 
 import java.sql.Connection;
 import java.sql.Driver;
@@ -23,6 +26,7 @@ import java.util.Optional;
 import java.util.Properties;
 
 import static com.google.common.base.Preconditions.checkState;
+import static java.lang.String.format;
 import static java.util.Objects.requireNonNull;
 
 public class DriverConnectionFactory
@@ -33,11 +37,12 @@ public class DriverConnectionFactory
     private final Properties connectionProperties;
     private final Optional<String> userCredentialName;
     private final Optional<String> passwordCredentialName;
+    private final Optional<PoolingDriverConnectionFactory> pool;
     private final Optional<ConnectionLeases> leases;
 
     public DriverConnectionFactory(Driver driver, BaseJdbcConfig config)
     {
-        this(driver, config.getConnectionUrl(), config, basicConnectionProperties(config));
+        this(driver, config.getConnectionUrl(), config, basicConnectionProperties(config), true);
     }
 
     /**
@@ -47,10 +52,31 @@ public class DriverConnectionFactory
      */
     public DriverConnectionFactory(Driver driver, BaseJdbcConfig config, Properties connectionProperties)
     {
-        this(driver, config.getConnectionUrl(), config, connectionProperties);
+        this(driver, config.getConnectionUrl(), config, connectionProperties, true);
     }
 
-    private DriverConnectionFactory(Driver driver, String connectionUrl, BaseJdbcConfig config, Properties connectionProperties)
+    /**
+     * For a connector whose backend should never be pooled, because it pools inside its driver or
+     * expects a session per request. A catalog of such a connector that asks for a pool fails to
+     * load rather than silently going unpooled. Reuse within a query is unaffected, since it holds
+     * no connection past the query that opened it.
+     */
+    public static DriverConnectionFactory withoutPooling(String connectorName, Driver driver, BaseJdbcConfig config)
+    {
+        return withoutPooling(connectorName, driver, config, basicConnectionProperties(config));
+    }
+
+    public static DriverConnectionFactory withoutPooling(String connectorName, Driver driver, BaseJdbcConfig config, Properties connectionProperties)
+    {
+        requireNonNull(connectorName, "connectorName is null");
+        if (config.isConnectionPoolEnabled()) {
+            throw new ConfigurationException(ImmutableList.of(new Message(
+                    format("Catalog property connection-pool.enabled is not supported by the %s connector", connectorName))));
+        }
+        return new DriverConnectionFactory(driver, config.getConnectionUrl(), config, connectionProperties, false);
+    }
+
+    private DriverConnectionFactory(Driver driver, String connectionUrl, BaseJdbcConfig config, Properties connectionProperties, boolean poolingSupported)
     {
         this(
                 driver,
@@ -58,6 +84,9 @@ public class DriverConnectionFactory
                 Optional.ofNullable(config.getUserCredentialName()),
                 Optional.ofNullable(config.getPasswordCredentialName()),
                 connectionProperties,
+                poolingSupported && config.isConnectionPoolEnabled() ?
+                        Optional.of(new PoolingDriverConnectionFactory(driver, connectionUrl, config)) :
+                        Optional.empty(),
                 config.isConnectionReuseEnabled() ? config.getConnectionReuseRetention().toMillis() : -1,
                 config.getConnectionReuseMaxRetained());
     }
@@ -76,7 +105,7 @@ public class DriverConnectionFactory
 
     public DriverConnectionFactory(Driver driver, String connectionUrl, Optional<String> userCredentialName, Optional<String> passwordCredentialName, Properties connectionProperties)
     {
-        this(driver, connectionUrl, userCredentialName, passwordCredentialName, connectionProperties, -1, 0);
+        this(driver, connectionUrl, userCredentialName, passwordCredentialName, connectionProperties, Optional.empty(), -1, 0);
     }
 
     private DriverConnectionFactory(
@@ -85,11 +114,15 @@ public class DriverConnectionFactory
             Optional<String> userCredentialName,
             Optional<String> passwordCredentialName,
             Properties connectionProperties,
+            Optional<PoolingDriverConnectionFactory> pool,
             long reuseRetentionMillis,
             int reuseMaxRetained)
     {
+        this.pool = requireNonNull(pool, "pool is null");
+        // Reuse sits above the pool when both are on, so a nested call is served from the lease and
+        // the pool sees one borrow per operation rather than one per call.
         this.leases = reuseRetentionMillis >= 0 ?
-                Optional.of(new ConnectionLeases(this::openNewConnection, reuseRetentionMillis, reuseMaxRetained)) :
+                Optional.of(new ConnectionLeases(properties -> openNewConnection(properties, true), reuseRetentionMillis, reuseMaxRetained)) :
                 Optional.empty();
         this.driver = requireNonNull(driver, "driver is null");
         this.connectionUrl = requireNonNull(connectionUrl, "connectionUrl is null");
@@ -103,7 +136,9 @@ public class DriverConnectionFactory
     public Connection openConnection(JdbcIdentity identity)
             throws SQLException
     {
-        return openNewConnection(connectionPropertiesFor(identity));
+        // A split or a page sink holds its connection while other operators run, so it never waits
+        // for the pool; see PoolingDriverConnectionFactory.
+        return openNewConnection(connectionPropertiesFor(identity), false);
     }
 
     @Override
@@ -114,7 +149,7 @@ public class DriverConnectionFactory
         if (leases.isPresent()) {
             return leases.get().openConnection(session.getQueryId(), identity, properties);
         }
-        return openNewConnection(properties);
+        return openNewConnection(properties, true);
     }
 
     @Override
@@ -139,9 +174,13 @@ public class DriverConnectionFactory
         return updatedConnectionProperties;
     }
 
-    private Connection openNewConnection(Properties connectionProperties)
+    private Connection openNewConnection(Properties connectionProperties, boolean waitForPool)
             throws SQLException
     {
+        if (pool.isPresent()) {
+            return pool.get().openConnection(connectionProperties, waitForPool);
+        }
+
         Connection connection = driver.connect(connectionUrl, connectionProperties);
         checkState(connection != null, "Driver returned null connection");
         return connection;
@@ -151,6 +190,7 @@ public class DriverConnectionFactory
     public void close()
     {
         leases.ifPresent(ConnectionLeases::close);
+        pool.ifPresent(PoolingDriverConnectionFactory::close);
     }
 
     private static void setConnectionProperty(Properties connectionProperties, Map<String, String> extraCredentials, String credentialName, String propertyName)
