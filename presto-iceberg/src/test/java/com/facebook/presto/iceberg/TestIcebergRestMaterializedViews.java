@@ -35,7 +35,6 @@ import java.util.Map;
 import java.util.Optional;
 
 import static com.facebook.presto.iceberg.CatalogType.REST;
-import static com.facebook.presto.iceberg.IcebergWarningCode.BOUNDED_REFRESH_IGNORED;
 import static com.facebook.presto.iceberg.rest.IcebergRestTestUtil.getRestServer;
 import static com.facebook.presto.iceberg.rest.IcebergRestTestUtil.restConnectorProperties;
 import static com.google.common.io.MoreFiles.deleteRecursively;
@@ -267,10 +266,18 @@ public class TestIcebergRestMaterializedViews
         }
     }
 
+    /**
+     * A version 2 base takes the bound like any other. It has no per-row lineage, but on an
+     * append-only range it does not need any: appended rows land only in new files, so the file's
+     * sequence number is its rows' sequence number, and {@code $data_sequence_number} answers the
+     * same question {@code _last_updated_sequence_number} answers on version 3.
+     *
+     * <p>This previously advanced straight to HEAD and warned that the bound had been ignored,
+     * because the bound was expressed over the version 3 column, which a version 2 table lacks.
+     */
     @Test
-    public void testV2BaseFallsBackToUnboundedRefresh()
+    public void testV2BaseHonoursBoundedRefresh()
     {
-        // V2 lacks per-row lineage; bound is ignored and a warning is emitted.
         String base = "bounded_v2_base";
         String mv = "bounded_v2_mv";
         try {
@@ -286,11 +293,15 @@ public class TestIcebergRestMaterializedViews
             }
             long head = headSnapshot(base);
 
-            MaterializedResult refresh = getQueryRunner().execute("REFRESH MATERIALIZED VIEW " + mv);
-            assertTrue(refresh.getWarnings().stream()
-                            .anyMatch(w -> w.getWarningCode().equals(BOUNDED_REFRESH_IGNORED.toWarningCode())),
-                    "expected V2-base warning to be emitted");
-            assertEquals(baseWatermark(mv, base), head, "V2 bases should advance all the way to HEAD in one refresh");
+            assertQuerySucceeds("REFRESH MATERIALIZED VIEW " + mv);
+            assertNotEquals(baseWatermark(mv, base), head,
+                    "the bound should stop the watermark short of HEAD");
+
+            // Five appends, two snapshots per refresh: successive refreshes converge on HEAD.
+            for (int i = 0; i < 5 && baseWatermark(mv, base) != head; i++) {
+                assertQuerySucceeds("REFRESH MATERIALIZED VIEW " + mv);
+            }
+            assertEquals(baseWatermark(mv, base), head, "successive bounded refreshes should reach HEAD");
             assertQuery("SELECT COUNT(*) FROM " + mv, "SELECT 6");
         }
         finally {
