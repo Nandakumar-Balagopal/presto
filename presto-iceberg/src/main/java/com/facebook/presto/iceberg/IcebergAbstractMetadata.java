@@ -41,6 +41,7 @@ import com.facebook.presto.iceberg.procedure.context.IcebergCommonProcedureConte
 import com.facebook.presto.iceberg.statistics.StatisticsFileCache;
 import com.facebook.presto.iceberg.transaction.IcebergTransactionContext;
 import com.facebook.presto.iceberg.transaction.IcebergTransactionMetadata;
+import com.facebook.presto.spi.ChangedRowsPredicate;
 import com.facebook.presto.spi.ColumnHandle;
 import com.facebook.presto.spi.ColumnMetadata;
 import com.facebook.presto.spi.ConnectorDeleteTableHandle;
@@ -50,6 +51,7 @@ import com.facebook.presto.spi.ConnectorInsertTableHandle;
 import com.facebook.presto.spi.ConnectorMergeTableHandle;
 import com.facebook.presto.spi.ConnectorNewTableLayout;
 import com.facebook.presto.spi.ConnectorOutputTableHandle;
+import com.facebook.presto.spi.ConnectorRefreshMaterializedViewHandle;
 import com.facebook.presto.spi.ConnectorSession;
 import com.facebook.presto.spi.ConnectorTableHandle;
 import com.facebook.presto.spi.ConnectorTableLayout;
@@ -106,6 +108,7 @@ import org.apache.iceberg.AppendFiles;
 import org.apache.iceberg.BaseTable;
 import org.apache.iceberg.DataFile;
 import org.apache.iceberg.DataFiles;
+import org.apache.iceberg.DataOperations;
 import org.apache.iceberg.DeleteFiles;
 import org.apache.iceberg.FileFormat;
 import org.apache.iceberg.FileMetadata;
@@ -146,6 +149,7 @@ import org.apache.iceberg.types.Types;
 import org.apache.iceberg.types.Types.NestedField;
 import org.apache.iceberg.types.Types.StringType;
 import org.apache.iceberg.util.CharSequenceSet;
+import org.apache.iceberg.util.SnapshotUtil;
 import org.apache.iceberg.view.View;
 
 import java.io.IOException;
@@ -199,6 +203,7 @@ import static com.facebook.presto.iceberg.IcebergErrorCode.ICEBERG_INVALID_SNAPS
 import static com.facebook.presto.iceberg.IcebergErrorCode.ICEBERG_TRANSACTION_CONFLICT_ERROR;
 import static com.facebook.presto.iceberg.IcebergMaterializedViewProperties.getMaxSnapshotsPerRefresh;
 import static com.facebook.presto.iceberg.IcebergMaterializedViewProperties.getRefreshType;
+import static com.facebook.presto.iceberg.IcebergMaterializedViewProperties.getRowLevelIncrementalRefresh;
 import static com.facebook.presto.iceberg.IcebergMaterializedViewProperties.getStaleReadBehavior;
 import static com.facebook.presto.iceberg.IcebergMaterializedViewProperties.getStalenessWindow;
 import static com.facebook.presto.iceberg.IcebergMaterializedViewProperties.getStorageSchema;
@@ -248,7 +253,7 @@ import static com.facebook.presto.iceberg.IcebergUtil.getSortFields;
 import static com.facebook.presto.iceberg.IcebergUtil.getTableComment;
 import static com.facebook.presto.iceberg.IcebergUtil.opsFromTable;
 import static com.facebook.presto.iceberg.IcebergUtil.resolveSnapshotIdByName;
-import static com.facebook.presto.iceberg.IcebergUtil.supportsRowLineage;
+import static com.facebook.presto.iceberg.IcebergUtil.supportsChangeTracking;
 import static com.facebook.presto.iceberg.IcebergUtil.toHiveColumns;
 import static com.facebook.presto.iceberg.IcebergUtil.tryGetLocation;
 import static com.facebook.presto.iceberg.IcebergUtil.tryGetProperties;
@@ -259,7 +264,6 @@ import static com.facebook.presto.iceberg.IcebergUtil.validateMinimumFormatVersi
 import static com.facebook.presto.iceberg.IcebergUtil.validateNoBranchInBaseTables;
 import static com.facebook.presto.iceberg.IcebergUtil.validateNoBranchSpecified;
 import static com.facebook.presto.iceberg.IcebergUtil.validateTableMode;
-import static com.facebook.presto.iceberg.IcebergWarningCode.BOUNDED_REFRESH_IGNORED;
 import static com.facebook.presto.iceberg.IcebergWarningCode.SORT_COLUMN_TRANSFORM_NOT_SUPPORTED_WARNING;
 import static com.facebook.presto.iceberg.IcebergWarningCode.USE_OF_DEPRECATED_TABLE_PROPERTY;
 import static com.facebook.presto.iceberg.PartitionFields.getPartitionColumnName;
@@ -343,6 +347,14 @@ public abstract class IcebergAbstractMetadata
     protected static final String PRESTO_MATERIALIZED_VIEW_MAX_SNAPSHOTS_PER_REFRESH = "presto.materialized_view.max_snapshots_per_refresh";
     protected static final String PRESTO_MATERIALIZED_VIEW_LAST_REFRESH_TIMESTAMP = "presto.materialized_view.last_refresh_timestamp";
     protected static final String PRESTO_MATERIALIZED_VIEW_USE_TIMESTAMP_BASED_STALENESS = "presto.materialized_view.use_timestamp_based_staleness";
+    protected static final String PRESTO_MATERIALIZED_VIEW_ROW_LEVEL_INCREMENTAL_REFRESH = "presto.materialized_view.row_level_incremental_refresh";
+
+    /**
+     * How far back isAppendOnlyRange will walk before giving up and reporting not-append-only.
+     * Chosen well above any realistic refresh interval; it exists to bound a traversal that runs on
+     * every status call, not to express a policy about how stale a view may be.
+     */
+    private static final int MAX_SNAPSHOTS_EXAMINED_FOR_APPEND_ONLY = 1000;
 
     protected static final int CURRENT_MATERIALIZED_VIEW_FORMAT_VERSION = 1;
 
@@ -1666,6 +1678,34 @@ public abstract class IcebergAbstractMetadata
         return getTableHandle(session, tableName, Optional.empty());
     }
 
+    /**
+     * Whether every snapshot after {@code fromSnapshotId} up to and including {@code toSnapshotId}
+     * only added data. Anything else -- a delete, an overwrite, a compaction rewrite -- can remove
+     * rows, which a predicate over a sequence number cannot detect: it finds rows that are still
+     * there, and a removed row is not.
+     *
+     * <p>Bounded. A view that has not been refreshed for a long time can be thousands of snapshots
+     * behind, and this runs on every status call. Past the bound it reports not-append-only, which
+     * sends the refresh to the partition-level path -- the same answer it would give for a range
+     * that genuinely held a delete, and the conservative one.
+     */
+    private static boolean isAppendOnlyRange(Table table, long fromSnapshotId, long toSnapshotId)
+    {
+        if (toSnapshotId == 0 || fromSnapshotId == toSnapshotId) {
+            return true;
+        }
+        int examined = 0;
+        for (Snapshot snapshot : SnapshotUtil.ancestorsBetween(table, toSnapshotId, fromSnapshotId)) {
+            if (++examined > MAX_SNAPSHOTS_EXAMINED_FOR_APPEND_ONLY) {
+                return false;
+            }
+            if (!DataOperations.APPEND.equals(snapshot.operation())) {
+                return false;
+            }
+        }
+        return true;
+    }
+
     @Override
     public IcebergTableHandle getTableHandle(ConnectorSession session, SchemaTableName tableName, Optional<ConnectorTableVersion> tableVersion)
     {
@@ -2219,6 +2259,8 @@ public abstract class IcebergAbstractMetadata
                             .ifPresent(window -> properties.put(PRESTO_MATERIALIZED_VIEW_STALENESS_WINDOW, window.toString()));
                     getRefreshType(materializedViewProperties)
                             .ifPresent(refreshType -> properties.put(PRESTO_MATERIALIZED_VIEW_REFRESH_TYPE, refreshType.name()));
+                    getRowLevelIncrementalRefresh(materializedViewProperties)
+                            .ifPresent(rowLevel -> properties.put(PRESTO_MATERIALIZED_VIEW_ROW_LEVEL_INCREMENTAL_REFRESH, rowLevel.toString()));
                     OptionalInt maxSnapshotsPerRefresh = getMaxSnapshotsPerRefresh(materializedViewProperties);
                     if (maxSnapshotsPerRefresh.isPresent()) {
                         properties.put(PRESTO_MATERIALIZED_VIEW_MAX_SNAPSHOTS_PER_REFRESH, Integer.toString(maxSnapshotsPerRefresh.getAsInt()));
@@ -2352,6 +2394,10 @@ public abstract class IcebergAbstractMetadata
         Optional<MaterializedViewRefreshType> refreshType = getOptionalEnumProperty(
                 viewProperties, PRESTO_MATERIALIZED_VIEW_REFRESH_TYPE, MaterializedViewRefreshType.class);
 
+        Optional<Boolean> rowLevelIncrementalRefresh = Optional.ofNullable(
+                        viewProperties.get(PRESTO_MATERIALIZED_VIEW_ROW_LEVEL_INCREMENTAL_REFRESH))
+                .map(Boolean::parseBoolean);
+
         Optional<List<String>> validRefreshColumns = Optional.empty();
         try {
             SchemaTableName storageTable = new SchemaTableName(storageSchema, storageTableName);
@@ -2383,7 +2429,8 @@ public abstract class IcebergAbstractMetadata
                 ImmutableList.of(),
                 validRefreshColumns,
                 stalenessConfig,
-                refreshType));
+                refreshType,
+                rowLevelIncrementalRefresh));
     }
 
     @Override
@@ -2477,18 +2524,12 @@ public abstract class IcebergAbstractMetadata
         OptionalInt maxSnapshotsPerRefresh = resolveMaxSnapshotsPerRefresh(session, props);
 
         ImmutableMap.Builder<SchemaTableName, MaterializedViewStatus.MaterializedDataPredicates> predicatesByBase = ImmutableMap.builder();
+        ImmutableMap.Builder<SchemaTableName, ChangedRowsPredicate> changedRowsByBase = ImmutableMap.builder();
         for (SchemaTableName baseTable : definition.get().getBaseTables()) {
             Table baseIcebergTable = getIcebergTable(session, baseTable);
             long currentSnapshotId = baseIcebergTable.currentSnapshot() != null
                     ? baseIcebergTable.currentSnapshot().snapshotId()
                     : 0L;
-
-            if (maxSnapshotsPerRefresh.isPresent() && !supportsRowLineage(baseIcebergTable)) {
-                session.getWarningCollector().add(new PrestoWarning(
-                        BOUNDED_REFRESH_IGNORED,
-                        format("max_snapshots_per_refresh ignored for materialized view %s: base table %s is Iceberg V2 and lacks row lineage; advancing to HEAD",
-                                materializedViewName, baseTable)));
-            }
 
             String key = getBaseTableViewPropertyName(baseTable);
             String recordedSnapshotStr = props.get(key);
@@ -2526,11 +2567,47 @@ public abstract class IcebergAbstractMetadata
             }
 
             TupleDomain<String> incrementalRefreshPredicate = TupleDomain.all();
+            TupleDomain<ColumnHandle> refreshBound = TupleDomain.all();
             if (targetSnapshotId != currentSnapshotId) {
                 long targetSequenceNumber = baseIcebergTable.snapshot(targetSnapshotId).sequenceNumber();
                 incrementalRefreshPredicate = TupleDomain.withColumnDomains(ImmutableMap.of(
-                        MetadataColumns.LAST_UPDATED_SEQUENCE_NUMBER.name(),
+                        changeTrackingColumnName(),
                         Domain.create(ValueSet.ofRanges(Range.lessThanOrEqual(BigintType.BIGINT, targetSequenceNumber)), false)));
+                refreshBound = TupleDomain.withColumnDomains(ImmutableMap.of(
+                        changeTrackingColumn(),
+                        Domain.create(ValueSet.ofRanges(Range.lessThanOrEqual(BigintType.BIGINT, targetSequenceNumber)), false)));
+            }
+
+            // Row-level change tracking requires a concrete recorded snapshot. A base table
+            // with no recorded snapshot continues through the existing partition path.
+            //
+            // It also requires the range to contain nothing but appends. The changed-rows predicate
+            // identifies changed rows by their sequence number, which can only find rows that are
+            // still there, so a row removed in the range is invisible to it. A group that lost all
+            // its rows would keep its stale aggregate: the engine excludes it from the fresh branch
+            // and has nothing to recompute it from. Withholding the predicate here leaves such a
+            // range to the partition-level path, which derives changed partitions from metadata and
+            // does see the removals.
+            if (recordedSnapshotId != 0
+                    && supportsChangeTracking(baseIcebergTable)
+                    && isAppendOnlyRange(baseIcebergTable, recordedSnapshotId, currentSnapshotId)) {
+                Snapshot recordedSnapshot = baseIcebergTable.snapshot(recordedSnapshotId);
+                if (recordedSnapshot != null) {
+                    ConnectorTableVersion recordedVersion = new ConnectorTableVersion(
+                            VersionType.VERSION,
+                            VersionOperator.EQUAL,
+                            BigintType.BIGINT,
+                            recordedSnapshotId);
+                    changedRowsByBase.put(baseTable, new ChangedRowsPredicate(
+                            ImmutableList.of(TupleDomain.withColumnDomains(ImmutableMap.of(
+                                    changeTrackingColumn(),
+                                    Domain.create(ValueSet.ofRanges(Range.greaterThan(BigintType.BIGINT, recordedSnapshot.sequenceNumber())), false)))),
+                            refreshBound,
+                            // Every snapshot in the range was checked to be an APPEND above, which
+                            // adds data files and removes none, so nothing present at the recorded
+                            // version was modified or removed.
+                            true));
+                }
             }
 
             // We pass an empty list of column names for now as they are not used when legacy_materialized_views=false.
@@ -2544,7 +2621,11 @@ public abstract class IcebergAbstractMetadata
         if (staleBases.isEmpty()) {
             return new MaterializedViewStatus(FULLY_MATERIALIZED, ImmutableMap.of(), lastFreshTime);
         }
-        return new MaterializedViewStatus(PARTIALLY_MATERIALIZED, staleBases, lastFreshTime);
+        return new MaterializedViewStatus(
+                PARTIALLY_MATERIALIZED,
+                staleBases,
+                lastFreshTime,
+                changedRowsByBase.build());
     }
 
     private MaterializedViewStatus getTimestampBasedMaterializedViewStatus(
@@ -2634,9 +2715,41 @@ public abstract class IcebergAbstractMetadata
     }
 
     /**
+     * The column whose value says when a row last changed.
+     *
+     * <p>Every data file carries the sequence number of the commit that added it, which Presto
+     * exposes per row as {@code $data_sequence_number}. On an append-only range that is exactly the
+     * row's own change point: appended rows land only in new files, so the file's number is its
+     * rows' number.
+     *
+     * <p>Format version 3 additionally records a per-row {@code _last_updated_sequence_number}, and
+     * this used to prefer it there. It answered the same question on every range this connector can
+     * actually produce. The two diverge only once a file has been rewritten with some of its rows
+     * changed and some not -- and a rewrite is a REPLACE snapshot, which
+     * {@link #isAppendOnlyRange} declines, so the divergence was unreachable. Version 3 also cannot
+     * take a row-level write at all in this connector, leaving an append as its only mutation.
+     *
+     * <p>So the per-row column bought nothing and cost a format-version branch, plus the
+     * implication that this path depends on row lineage. It does not.
+     */
+    private static IcebergColumnHandle changeTrackingColumn()
+    {
+        return DATA_SEQUENCE_NUMBER_COLUMN_HANDLE;
+    }
+
+    /**
+     * {@link #changeTrackingColumn} by name, for the predicates keyed by column name rather than by
+     * handle.
+     */
+    private static String changeTrackingColumnName()
+    {
+        return DATA_SEQUENCE_NUMBER.getColumnName();
+    }
+
+    /**
      * Returns the snapshot id a bounded refresh should advance a base's watermark to, or empty
-     * if no bounded target applies (V2 base, already at HEAD, watermark off HEAD's ancestry, or
-     * unbounded). Callers fall through to HEAD with {@code orElse(currentSnapshotId)}.
+     * if no bounded target applies (version 1 base, already at HEAD, watermark off HEAD's ancestry,
+     * or unbounded). Callers fall through to HEAD with {@code orElse(currentSnapshotId)}.
      */
     static OptionalLong chooseTargetSnapshot(Table baseTable, long watermark, OptionalInt maxSnapshots)
     {
@@ -2644,7 +2757,11 @@ public abstract class IcebergAbstractMetadata
         if (currentSnapshot == null) {
             return OptionalLong.empty();
         }
-        if (!supportsRowLineage(baseTable)) {
+        // A bound is expressed as a cap on the change-tracking column, which a version 1 table
+        // reports as zero for every row. The cap would be vacuously true, so the refresh would
+        // recompute everything up to HEAD while recording a watermark short of it -- leaving the
+        // storage table holding data its own watermark says it does not have.
+        if (!supportsChangeTracking(baseTable)) {
             return OptionalLong.empty();
         }
         long head = currentSnapshot.snapshotId();
@@ -2807,9 +2924,7 @@ public abstract class IcebergAbstractMetadata
         SchemaTableName materializedViewName = icebergTableHandle.getMaterializedViewName().get();
         MaterializedViewStatus status = getMaterializedViewStatus(session, materializedViewName, TupleDomain.all());
         boolean fullRefreshRequired = !status.isFullyMaterialized()
-                && (status.getPartitionsFromBaseTables().isEmpty()
-                || status.getPartitionsFromBaseTables().values().stream()
-                .anyMatch(p -> p.getPredicateDisjuncts().isEmpty()));
+                && !status.hasPartitionRefreshData();
 
         return new IcebergInsertTableHandle(
                 storageTableHandle.getSchemaName(),
@@ -2824,6 +2939,18 @@ public abstract class IcebergAbstractMetadata
                 getSupportedSortFields(storageTable.schema(), storageTable.sortOrder()),
                 Optional.of(materializedViewName),
                 fullRefreshRequired);
+    }
+
+    @Override
+    public Optional<ConnectorOutputMetadata> finishRefreshMaterializedView(
+            ConnectorSession session,
+            ConnectorRefreshMaterializedViewHandle refreshHandle,
+            Collection<Slice> fragments,
+            Collection<ComputedStatistics> computedStatistics)
+    {
+        // The insert-only implementation remains the compatibility path until the
+        // execution layer supplies delete fragments alongside recomputed rows.
+        return finishRefreshMaterializedView(session, (ConnectorInsertTableHandle) refreshHandle, fragments, computedStatistics);
     }
 
     @Override
